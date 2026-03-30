@@ -263,7 +263,7 @@ Examples:
     parser.add_argument("--max-frames", type=int, default=None, help="Max frames to sample per video (default: no limit)")
     parser.add_argument("--no-gdino", action="store_true", help="Disable Grounding DINO (faster, but no fine-grained privacy detection)")
     parser.add_argument("--auto-rotate", action="store_true", help="Auto-rotate portrait videos to landscape before processing")
-    parser.add_argument("--hand-detector-repo", default="ml_checks/models/weights/hand_object_detector", help="Path to 100DOH repo")
+    parser.add_argument("--hand-detector-repo", default="ml_checks/models/weights/hands23_detector", help="Path to Hands23 repo (or 100DOH for legacy)")
     parser.add_argument("--scrfd-root", default="ml_checks/models/weights/insightface", help="Path to InsightFace models")
     parser.add_argument("--gdino-cache", default="ml_checks/models/weights/grounding_dino", help="Path to Grounding DINO cache")
 

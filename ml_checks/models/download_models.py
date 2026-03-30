@@ -1,9 +1,9 @@
 """Download all required model weights and set up dependencies for ML checks.
 
 Usage:
-    python ml_checks/models/download_models.py          # Download SCRFD, YOLO11m, Grounding DINO
-    python ml_checks/models/download_models.py --100doh  # Also download + compile 100DOH
-    python ml_checks/models/download_models.py --all     # Everything
+    python ml_checks/models/download_models.py          # Download SCRFD, YOLO11m, Grounding DINO, Hands23
+    python ml_checks/models/download_models.py --100doh  # Also download + compile 100DOH (legacy)
+    python ml_checks/models/download_models.py --all     # Everything including legacy 100DOH
 """
 
 import os
@@ -61,10 +61,97 @@ def download_grounding_dino():
     return model, processor
 
 
-def download_100doh():
-    """Download 100DOH hand-object detector: clone repo, download weights, patch and compile C++ extensions."""
+def download_hands23():
+    """Download Hands23 hand-object detector (NeurIPS 2023)."""
     print("\n" + "=" * 60)
-    print("4. 100DOH Hand-Object Detector")
+    print("4. Hands23 Hand-Object Detector (NeurIPS 2023)")
+    print("=" * 60)
+
+    repo_dir = MODELS_DIR / "hands23_detector"
+
+    # Step 1: Clone repo
+    if not repo_dir.exists():
+        print("Cloning hands23_detector repo...")
+        subprocess.run(
+            ["git", "clone", "https://github.com/EvaCheng-cty/hands23_detector.git", str(repo_dir)],
+            check=True,
+        )
+    else:
+        print(f"Repo already exists at {repo_dir}")
+
+    # Step 2: Download weights
+    weights_dir = repo_dir / "model_weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    weight_file = weights_dir / "model_hands23.pth"
+
+    if not weight_file.exists():
+        print("Downloading Hands23 model weights (~400MB)...")
+        import urllib.request
+        url = "https://fouheylab.eecs.umich.edu/~dandans/projects/hands23/model_weights/model_hands23.pth"
+        urllib.request.urlretrieve(url, str(weight_file))
+        print(f"Weights saved to {weight_file} ({weight_file.stat().st_size / 1024 / 1024:.0f} MB)")
+    else:
+        print(f"Weights already exist at {weight_file}")
+
+    # Step 3: Verify Detectron2 is installed
+    try:
+        import detectron2
+        print(f"Detectron2 found: {detectron2.__version__}")
+    except ImportError:
+        print("Installing Detectron2...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "git+https://github.com/facebookresearch/detectron2.git",
+             "--no-build-isolation"],
+            check=True,
+        )
+
+    # Step 4: Patch hardcoded .cuda() calls for CPU compatibility
+    print("Patching hardcoded .cuda() calls for CPU compatibility...")
+    _patch_hands23_cuda(repo_dir)
+
+    print("Hands23 setup complete.")
+    return str(weight_file)
+
+
+def _patch_hands23_cuda(repo_dir: Path):
+    """Replace hardcoded .cuda() calls with device-aware .to(device) in Hands23 source."""
+    import re
+
+    # roi_heads.py — add _get_device helper and replace .cuda()
+    roi_heads = repo_dir / "hodetector" / "modeling" / "roi_heads" / "roi_heads.py"
+    if roi_heads.exists():
+        content = roi_heads.read_text()
+        if ".cuda()" in content:
+            # Add device helper if not already present
+            if "_get_device" not in content:
+                content = content.replace(
+                    "import cv2",
+                    'import cv2\n\ndef _get_device():\n    """Get device (cuda if available, else cpu)."""\n    return torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+                )
+            content = content.replace(".cuda()", ".to(_get_device())")
+            content = content.replace("device='cuda'", "device=_get_device()")
+            content = content.replace('device="cuda"', "device=_get_device()")
+            roi_heads.write_text(content)
+            print(f"  Patched roi_heads.py")
+
+    # positional_encoding.py
+    pos_enc = repo_dir / "hodetector" / "utils" / "positional_encoding.py"
+    if pos_enc.exists():
+        content = pos_enc.read_text()
+        if ".cuda()" in content:
+            content = content.replace(
+                ".cuda()",
+                '.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))',
+            )
+            pos_enc.write_text(content)
+            print(f"  Patched positional_encoding.py")
+
+
+def download_100doh():
+    """Download 100DOH hand-object detector (legacy): clone repo, download weights, patch and compile C++ extensions."""
+    print("\n" + "=" * 60)
+    print("5. 100DOH Hand-Object Detector (legacy)")
     print("=" * 60)
 
     repo_dir = MODELS_DIR / "hand_object_detector"
@@ -198,14 +285,10 @@ if __name__ == "__main__":
     download_scrfd()
     download_yolo11m()
     download_grounding_dino()
+    download_hands23()
 
+    # Legacy 100DOH (only if explicitly requested)
     if "--100doh" in sys.argv or "--all" in sys.argv:
         download_100doh()
-    else:
-        print("\n" + "=" * 60)
-        print("NOTE: 100DOH hand-object detector not downloaded.")
-        print("Run with --100doh or --all to include it:")
-        print(f"  python {sys.argv[0]} --100doh")
-        print("=" * 60)
 
     print("\nDone!")

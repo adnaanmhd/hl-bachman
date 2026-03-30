@@ -2,7 +2,7 @@
 
 Runs all models on sampled frames and distributes results to check functions.
 Pipeline:
-  Per frame: SCRFD -> YOLO11m -> 100DOH -> (Grounding DINO if flagged) -> heuristic
+  Per frame: SCRFD -> YOLO11m -> Hands23 -> (Grounding DINO if flagged) -> heuristic
   Distribute results to all 7 checks -> aggregate
 """
 
@@ -34,7 +34,8 @@ class PipelineConfig:
     # Model paths
     scrfd_root: str = "ml_checks/models/weights/insightface"
     yolo_model: str = "yolo11m.pt"
-    hand_detector_repo: str = "ml_checks/models/weights/hand_object_detector"
+    hand_detector_repo: str = "ml_checks/models/weights/hands23_detector"
+    # Legacy Hands23: "ml_checks/models/weights/hand_object_detector"
     gdino_cache: str = "ml_checks/models/weights/grounding_dino"
 
     # Thresholds
@@ -81,12 +82,19 @@ class MLCheckPipeline:
         self.yolo_detector = YOLODetector(model_path=self.config.yolo_model)
         print("  YOLO11m loaded")
 
-        # 3. 100DOH hand-object detector
-        from ml_checks.models.hand_detector import HandObjectDetector100DOH
-        self.hand_detector = HandObjectDetector100DOH(
+        # 3. Hands23 hand-object detector (NeurIPS 2023)
+        from ml_checks.models.hand_detector import HandObjectDetectorHands23
+        self.hand_detector = HandObjectDetectorHands23(
             repo_dir=self.config.hand_detector_repo,
         )
-        print("  100DOH loaded")
+        print("  Hands23 loaded")
+
+        # Legacy 100DOH (uncomment to revert):
+        # from ml_checks.models.hand_detector_100doh import HandObjectDetector100DOH
+        # self.hand_detector = HandObjectDetector100DOH(
+        #     repo_dir="ml_checks/models/weights/hand_object_detector",
+        # )
+        # print("  100DOH loaded")
 
         # 4. Grounding DINO (optional, for privacy)
         self.gdino_detector = None
@@ -142,7 +150,7 @@ class MLCheckPipeline:
 
         t_scrfd = 0
         t_yolo = 0
-        t_100doh = 0
+        t_hands23 = 0
 
         for i, frame in enumerate(frames):
             # SCRFD face detection
@@ -165,7 +173,7 @@ class MLCheckPipeline:
             # 100DOH hand-object detection
             t0 = time.perf_counter()
             hands, objects = self.hand_detector.detect(frame)
-            t_100doh += time.perf_counter() - t0
+            t_hands23 += time.perf_counter() - t0
             per_frame_hands.append(hands)
             per_frame_objects.append(objects)
 
@@ -174,7 +182,7 @@ class MLCheckPipeline:
 
         timings["scrfd"] = t_scrfd
         timings["yolo"] = t_yolo
-        timings["100doh"] = t_100doh
+        timings["hands23"] = t_hands23
 
         # Step 3: Grounding DINO on flagged frames (if enabled)
         per_frame_gdino = [[] for _ in frames]
@@ -255,7 +263,7 @@ class MLCheckPipeline:
         print(f"  Frame extraction: {timings['frame_extraction']:.2f}s")
         print(f"  SCRFD:            {timings['scrfd']:.2f}s")
         print(f"  YOLO11m:          {timings['yolo']:.2f}s")
-        print(f"  100DOH:           {timings['100doh']:.2f}s")
+        print(f"  Hands23:           {timings['hands23']:.2f}s")
         print(f"  Grounding DINO:   {timings['grounding_dino']:.2f}s")
         print(f"  TOTAL:            {total_time:.2f}s")
 

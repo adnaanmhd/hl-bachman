@@ -1,31 +1,30 @@
-"""Hand-Object detection using 100DOH (Understanding Human Hands in Contact at Internet Scale).
+"""Hand-Object detection for egocentric video quality checks.
 
-The 100DOH model is a Faster R-CNN (ResNet-101) trained on 100K+ egocentric images.
-It detects hands and objects, classifying:
-- Hand side (left/right)
-- Contact state: N (no contact), S (self), O (other person), P (portable object), F (stationary)
-- Offset vectors from hand to interacted object
+Active backend: Hands23 (NeurIPS 2023) — successor to 100DOH by the same research group.
+Outputs: hand bboxes, left/right, contact state, grasp type, object bboxes + masks.
+
+Previous backend (commented out): 100DOH (CVPR 2020)
+To revert to 100DOH, see hand_detector_100doh.py and swap the import in pipeline.py.
 
 Setup:
     python ml_checks/models/download_models.py --all
-
-Runtime (macOS):
-    The C extension links against libtorch. On macOS, set DYLD_LIBRARY_PATH *before* launching Python:
-        export DYLD_LIBRARY_PATH=$(python -c "import torch; print(torch.__file__.replace('__init__.py','lib'))")
-    On Linux this is typically not needed.
 """
 
 import os
 import sys
-import platform
 import numpy as np
 import torch
 import cv2
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+
+# ============================================================
+# Shared types — used by all check functions.
+# These stay the same regardless of which backend is active.
+# ============================================================
 
 class ContactState(Enum):
     NO_CONTACT = 0
@@ -47,259 +46,183 @@ class HandDetection:
     confidence: float
     side: HandSide
     contact_state: ContactState
-    offset_vector: np.ndarray | None = None  # unit vector + magnitude to interacted object
+    grasp_type: str | None = None  # Hands23 only: e.g. "NP-Palm", "Pow-Pris", etc.
+    offset_vector: np.ndarray | None = None  # 100DOH only
 
 
 @dataclass
 class ObjectDetection:
     bbox: np.ndarray  # [x1, y1, x2, y2]
     confidence: float
+    touch_type: str | None = None  # Hands23: "tool-object" relationship
 
 
-def _resolve_repo_dir(repo_dir: str | Path) -> Path:
-    """Resolve the 100DOH repo directory, checking it exists and is set up."""
-    repo_dir = Path(repo_dir).resolve()
-    if not repo_dir.exists():
-        raise FileNotFoundError(
-            f"100DOH repo not found at {repo_dir}. "
-            f"Run: python ml_checks/models/download_models.py --all"
-        )
-    weight_file = repo_dir / "models" / "res101_handobj_100K" / "pascal_voc" / "faster_rcnn_1_8_132028.pth"
-    if not weight_file.exists():
-        raise FileNotFoundError(
-            f"100DOH weights not found at {weight_file}. "
-            f"Run: python ml_checks/models/download_models.py --all"
-        )
-    so_files = list((repo_dir / "lib" / "model").glob("_C*.so")) + \
-               list((repo_dir / "lib" / "model").glob("_C*.pyd"))
-    if not so_files:
-        raise FileNotFoundError(
-            f"100DOH C extension not compiled. "
-            f"Run: cd {repo_dir / 'lib'} && python setup.py build develop"
-        )
-    return repo_dir
+# ============================================================
+# Hands23 contact/grasp/side label mappings
+# ============================================================
+
+HANDS23_CONTACT_MAP = {
+    0: ContactState.NO_CONTACT,
+    1: ContactState.SELF_CONTACT,
+    2: ContactState.OTHER_PERSON,
+    3: ContactState.PORTABLE_OBJ,   # "object_contact" in Hands23
+    4: ContactState.STATIONARY_OBJ,  # mapped from tool-object if needed
+}
+
+HANDS23_GRASP_NAMES = {
+    0: "NP-Palm",
+    1: "NP-Fin",
+    2: "Pow-Pris",
+    3: "Pre-Pris",
+    4: "Pow-Circ",
+    5: "Pre-Circ",
+    6: "Later",
+    7: "Other",
+}
+
+HANDS23_SIDE_MAP = {
+    0: HandSide.LEFT,
+    1: HandSide.RIGHT,
+}
 
 
-def _check_torch_lib_path():
-    """Verify torch shared libraries are findable at runtime (macOS issue)."""
-    if platform.system() != "Darwin":
-        return  # Linux/Windows typically don't need this
+# ============================================================
+# Hands23 Detector (active backend)
+# ============================================================
 
-    torch_lib = str(Path(torch.__file__).parent / "lib")
-    dyld = os.environ.get("DYLD_LIBRARY_PATH", "")
+class HandObjectDetectorHands23:
+    """Hands23 hand-object detector (NeurIPS 2023).
 
-    if torch_lib not in dyld:
-        # Try to load the extension anyway — it may work if rpath is set
-        try:
-            import ctypes
-            ctypes.CDLL(str(Path(torch_lib) / "libc10.dylib"))
-        except OSError:
-            raise RuntimeError(
-                f"torch libraries not found at runtime. On macOS, set DYLD_LIBRARY_PATH "
-                f"*before* launching Python:\n\n"
-                f"  export DYLD_LIBRARY_PATH=$(python -c \"import torch; "
-                f"print(torch.__file__.replace('__init__.py','lib'))\")\n\n"
-                f"Then re-run your command."
-            )
+    Faster R-CNN X-101-FPN trained on 250K images with rich annotations:
+    hand bbox, left/right, contact state, grasp type, object bbox, masks.
 
-
-class HandObjectDetector100DOH:
-    """100DOH hand-object detector wrapper.
-
-    Loads the ResNet-101 Faster R-CNN model trained on 100K+ego dataset.
-    Returns hand detections with contact state and object detections.
+    Uses Detectron2's DefaultPredictor for inference.
     """
 
     def __init__(
         self,
-        repo_dir: str | Path = "ml_checks/models/weights/hand_object_detector",
-        weight_file: str = "models/res101_handobj_100K/pascal_voc/faster_rcnn_1_8_132028.pth",
-        thresh_hand: float = 0.5,
-        thresh_obj: float = 0.5,
+        repo_dir: str | Path = "ml_checks/models/weights/hands23_detector",
+        weight_file: str = "model_weights/model_hands23.pth",
+        hand_thresh: float = 0.5,
+        obj_thresh: float = 0.3,
+        hand_rela_thresh: float = 0.3,
     ):
-        self.repo_dir = _resolve_repo_dir(repo_dir)
-        self.thresh_hand = thresh_hand
-        self.thresh_obj = thresh_obj
+        self.repo_dir = Path(repo_dir).resolve()
+        self.hand_thresh = hand_thresh
+        self.obj_thresh = obj_thresh
+        self.hand_rela_thresh = hand_rela_thresh
 
-        # Verify torch libs are loadable (fails fast with clear message on macOS)
-        _check_torch_lib_path()
+        # Validate setup
+        if not self.repo_dir.exists():
+            raise FileNotFoundError(
+                f"Hands23 repo not found at {self.repo_dir}. "
+                f"Run: python ml_checks/models/download_models.py --all"
+            )
+        weights_path = self.repo_dir / weight_file
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"Hands23 weights not found at {weights_path}. "
+                f"Run: python ml_checks/models/download_models.py --all"
+            )
 
-        # Add 100DOH lib to path so `model._C`, `model.utils.config`, etc. are importable
-        lib_dir = str(self.repo_dir / "lib")
+        # Add Hands23 repo to sys.path so hodetector package is importable
         repo_str = str(self.repo_dir)
-        if lib_dir not in sys.path:
-            sys.path.insert(0, lib_dir)
         if repo_str not in sys.path:
             sys.path.insert(0, repo_str)
 
-        import _init_paths  # noqa: F401 — sets up additional paths within the 100DOH repo
-        from model.utils.config import cfg, cfg_from_file, cfg_from_list
-        from model.faster_rcnn.resnet import resnet
-        from model.rpn.bbox_transform import bbox_transform_inv, clip_boxes
-        from model.roi_layers import nms
-        from model.utils.blob import im_list_to_blob
+        # Import Hands23 custom Detectron2 components (registers custom ROI heads)
+        import hodetector.modeling  # noqa: F401 — registers custom components with Detectron2
 
-        self._cfg = cfg
-        self._bbox_transform_inv = bbox_transform_inv
-        self._clip_boxes = clip_boxes
-        self._nms = nms
-        self._im_list_to_blob = im_list_to_blob
+        from detectron2.config import get_cfg
+        from detectron2.engine import DefaultPredictor
 
-        # Configure
-        cfg_from_file(str(self.repo_dir / "cfgs" / "res101.yml"))
-        cfg_from_list(["ANCHOR_SCALES", "[8, 16, 32, 64]", "ANCHOR_RATIOS", "[0.5, 1, 2]"])
-        cfg.USE_GPU_NMS = False
+        # Build config
+        cfg = get_cfg()
 
-        # Build and load model
-        pascal_classes = np.asarray(["__background__", "targetobject", "hand"])
-        self.classes = pascal_classes
+        # Add Hands23 custom config keys (extends Detectron2 cfg with custom heads)
+        from hodetector.config import get_meshrcnn_cfg_defaults
+        get_meshrcnn_cfg_defaults(cfg)
 
-        self.model = resnet(pascal_classes, 101, pretrained=False, class_agnostic=False)
-        self.model.create_architecture()
+        cfg.merge_from_file(str(self.repo_dir / "faster_rcnn_X_101_32x8d_FPN_3x_Hands23.yaml"))
+        cfg.MODEL.WEIGHTS = str(weights_path)
+        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = hand_thresh
+        cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-        load_path = str(self.repo_dir / weight_file)
-        checkpoint = torch.load(load_path, map_location="cpu", weights_only=False)
-        self.model.load_state_dict(checkpoint["model"])
-        if "pooling_mode" in checkpoint:
-            cfg.POOLING_MODE = checkpoint["pooling_mode"]
+        # Hands23 custom thresholds (used by roi_heads.py inference logic)
+        cfg.HAND = hand_thresh
+        cfg.FIRSTOBJ = obj_thresh
+        cfg.SECONDOBJ = 0.1
+        cfg.HAND_RELA = hand_rela_thresh
+        cfg.OBJ_RELA = 0.7
 
-        self.model.eval()
-
-        # Pre-allocate tensors
-        self._im_data = torch.FloatTensor(1)
-        self._im_info = torch.FloatTensor(1)
-        self._num_boxes = torch.LongTensor(1)
-        self._gt_boxes = torch.FloatTensor(1)
-        self._box_info = torch.FloatTensor(1)
-
-    def _get_image_blob(self, im: np.ndarray):
-        """Convert image to network input blob."""
-        im_orig = im.astype(np.float32, copy=True)
-        im_orig -= self._cfg.PIXEL_MEANS
-
-        im_shape = im_orig.shape
-        im_size_min = np.min(im_shape[0:2])
-        im_size_max = np.max(im_shape[0:2])
-
-        processed_ims = []
-        im_scale_factors = []
-
-        for target_size in self._cfg.TEST.SCALES:
-            im_scale = float(target_size) / float(im_size_min)
-            if np.round(im_scale * im_size_max) > self._cfg.TEST.MAX_SIZE:
-                im_scale = float(self._cfg.TEST.MAX_SIZE) / float(im_size_max)
-            resized = cv2.resize(im_orig, None, None, fx=im_scale, fy=im_scale,
-                                 interpolation=cv2.INTER_LINEAR)
-            im_scale_factors.append(im_scale)
-            processed_ims.append(resized)
-
-        blob = self._im_list_to_blob(processed_ims)
-        return blob, np.array(im_scale_factors)
+        self.predictor = DefaultPredictor(cfg)
+        self.cfg = cfg
 
     def detect(self, frame_bgr: np.ndarray) -> tuple[list[HandDetection], list[ObjectDetection]]:
         """Detect hands and objects in a BGR frame.
 
+        Hands23 pred_dz layout per instance:
+            [0:4]   — associated object bbox (x1, y1, x2, y2)
+            [4]     — interaction index (-1 = no interaction)
+            [5]     — hand_side (0=left, 1=right)
+            [6]     — grasp type index
+            [7]     — touch type index
+            [8]     — contact_state index
+            [9]     — interaction score
+            [10:18] — grasp scores (8 classes)
+            [18:25] — touch scores (7 classes)
+
+        Class mapping: 0=hand, 1=first_object, 2=second_object
+
         Returns:
             Tuple of (hand_detections, object_detections).
         """
-        blobs, im_scales = self._get_image_blob(frame_bgr)
-        im_blob = blobs
-        im_info_np = np.array(
-            [[im_blob.shape[1], im_blob.shape[2], im_scales[0]]],
-            dtype=np.float32,
-        )
+        outputs = self.predictor(frame_bgr)
+        instances = outputs["instances"].to("cpu")
 
-        im_data_pt = torch.from_numpy(im_blob).permute(0, 3, 1, 2)
-        im_info_pt = torch.from_numpy(im_info_np)
+        if len(instances) == 0:
+            return [], []
 
-        with torch.no_grad():
-            self._im_data.resize_(im_data_pt.size()).copy_(im_data_pt)
-            self._im_info.resize_(im_info_pt.size()).copy_(im_info_pt)
-            self._gt_boxes.resize_(1, 1, 5).zero_()
-            self._num_boxes.resize_(1).zero_()
-            self._box_info.resize_(1, 1, 5).zero_()
+        boxes = instances.pred_boxes.tensor.numpy()
+        scores = instances.scores.numpy()
+        classes = instances.pred_classes.numpy()
+        pred_dz = instances.pred_dz.numpy()
 
-            rois, cls_prob, bbox_pred, _, _, _, _, _, loss_list = self.model(
-                self._im_data, self._im_info, self._gt_boxes,
-                self._num_boxes, self._box_info,
-            )
-
-        scores = cls_prob.data.squeeze()
-        boxes = rois.data[:, :, 1:5]
-
-        # Extract predicted params
-        contact_vector = loss_list[0][0]
-        offset_vector = loss_list[1][0].detach()
-        lr_vector = loss_list[2][0].detach()
-
-        # Contact state (argmax of 5-class softmax)
-        _, contact_indices = torch.max(contact_vector, 2)
-        contact_indices = contact_indices.squeeze(0).unsqueeze(-1).float()
-
-        # Hand side (sigmoid > 0.5 = right)
-        lr = torch.sigmoid(lr_vector) > 0.5
-        lr = lr.squeeze(0).float()
-
-        # Apply bbox regression
-        box_deltas = bbox_pred.data
-        if self._cfg.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED:
-            box_deltas = box_deltas.view(-1, 4) * torch.FloatTensor(
-                self._cfg.TRAIN.BBOX_NORMALIZE_STDS
-            ) + torch.FloatTensor(self._cfg.TRAIN.BBOX_NORMALIZE_MEANS)
-            box_deltas = box_deltas.view(1, -1, 4 * len(self.classes))
-
-        pred_boxes = self._bbox_transform_inv(boxes, box_deltas, 1)
-        pred_boxes = self._clip_boxes(pred_boxes, self._im_info.data, 1)
-        pred_boxes /= im_scales[0]
-
-        pred_boxes = pred_boxes.squeeze()
-
-        # Parse detections
         hand_detections = []
         object_detections = []
 
-        for j in range(1, len(self.classes)):
-            cls_name = self.classes[j]
-            thresh = self.thresh_hand if cls_name == "hand" else self.thresh_obj
+        for i in range(len(instances)):
+            cls = int(classes[i])
+            bbox = boxes[i]
+            conf = float(scores[i])
+            dz = pred_dz[i]
 
-            inds = torch.nonzero(scores[:, j] > thresh).view(-1)
-            if inds.numel() == 0:
-                continue
+            if cls == 0:
+                # Hand detection
+                side_idx = int(dz[5])
+                side = HANDS23_SIDE_MAP.get(side_idx, HandSide.UNKNOWN)
 
-            cls_scores = scores[:, j][inds]
-            _, order = torch.sort(cls_scores, 0, True)
-            cls_boxes = pred_boxes[inds][:, j * 4: (j + 1) * 4]
+                contact_idx = int(dz[8])
+                contact_state = HANDS23_CONTACT_MAP.get(contact_idx, ContactState.NO_CONTACT)
 
-            cls_dets = torch.cat(
-                (cls_boxes, cls_scores.unsqueeze(1),
-                 contact_indices[inds], offset_vector.squeeze(0)[inds], lr[inds]),
-                1,
-            )
-            cls_dets = cls_dets[order]
-            keep = self._nms(cls_boxes[order, :], cls_scores[order], self._cfg.TEST.NMS)
-            cls_dets = cls_dets[keep.view(-1).long()].cpu().numpy()
+                grasp_idx = int(dz[6])
+                grasp_type = HANDS23_GRASP_NAMES.get(grasp_idx)
 
-            if cls_name == "hand":
-                for det in cls_dets:
-                    bbox = det[:4]
-                    conf = float(det[4])
-                    contact_idx = int(det[5])
-                    offset = det[6:9]  # unit vector (3 values)
-                    is_right = bool(det[-1] > 0.5) if len(det) > 10 else True
-
-                    hand_detections.append(HandDetection(
-                        bbox=bbox,
-                        confidence=conf,
-                        side=HandSide.RIGHT if is_right else HandSide.LEFT,
-                        contact_state=ContactState(min(contact_idx, 4)),
-                        offset_vector=offset,
-                    ))
-            elif cls_name == "targetobject":
-                for det in cls_dets:
-                    object_detections.append(ObjectDetection(
-                        bbox=det[:4],
-                        confidence=float(det[4]),
-                    ))
+                hand_detections.append(HandDetection(
+                    bbox=bbox,
+                    confidence=conf,
+                    side=side,
+                    contact_state=contact_state,
+                    grasp_type=grasp_type,
+                ))
+            elif cls in (1, 2):
+                # Object detection (first or second object)
+                touch_idx = int(dz[7]) if dz[7] != 100 else None
+                object_detections.append(ObjectDetection(
+                    bbox=bbox,
+                    confidence=conf,
+                    touch_type=f"type_{touch_idx}" if touch_idx is not None else None,
+                ))
 
         return hand_detections, object_detections
 
@@ -312,7 +235,7 @@ class HandObjectDetector100DOH:
             times.append(time.perf_counter() - t0)
         times_ms = [t * 1000 for t in times]
         return {
-            "model": "100DOH hand_object_detector (ResNet-101)",
+            "model": "Hands23 (Faster R-CNN X-101-FPN, NeurIPS 2023)",
             "frames": len(frames),
             "p50_ms": round(np.percentile(times_ms, 50), 2),
             "p95_ms": round(np.percentile(times_ms, 95), 2),
@@ -320,3 +243,9 @@ class HandObjectDetector100DOH:
             "mean_ms": round(np.mean(times_ms), 2),
             "total_s": round(sum(times), 3),
         }
+
+
+# ============================================================
+# 100DOH Detector (previous backend — kept for reference)
+# To use: from ml_checks.models.hand_detector_100doh import HandObjectDetector100DOH
+# ============================================================
