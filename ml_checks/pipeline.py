@@ -1,9 +1,14 @@
-"""Unified ML inference pipeline for all 7 video quality checks.
+"""Unified video validation pipeline.
 
-Runs all models on sampled frames and distributes results to check functions.
-Pipeline:
-  Per frame: SCRFD -> YOLO11m -> Hands23 -> (Grounding DINO if flagged) -> heuristic
-  Distribute results to all 7 checks -> aggregate
+Runs all checks in order:
+  1. Video metadata (short-circuits on failure)
+  2. Frame-level quality
+  3. Luminance & blur
+  4. Motion analysis
+  5. ML detection (SCRFD, YOLO11m, Hands23, Grounding DINO)
+
+Results are keyed by category: meta_*, quality_*, luminance_blur,
+motion_*, ml_*.
 """
 
 import os
@@ -14,6 +19,15 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from ml_checks.checks.check_results import CheckResult
+from ml_checks.utils.video_metadata import get_video_metadata
+from ml_checks.checks.video_metadata import run_all_metadata_checks
+from ml_checks.checks.frame_quality import (
+    check_average_brightness,
+    check_brightness_stability,
+    check_near_black_frames,
+)
+from ml_checks.checks.luminance_blur import check_luminance_blur, LuminanceBlurConfig
+from ml_checks.checks.motion_analysis import check_camera_stability, check_frozen_segments
 from ml_checks.checks.face_presence import check_face_presence
 from ml_checks.checks.participants import check_participants
 from ml_checks.checks.hand_visibility import check_hand_visibility
@@ -24,9 +38,27 @@ from ml_checks.checks.pov_hand_angle import check_pov_hand_angle
 from ml_checks.utils.frame_extractor import extract_frames
 
 
+# All non-metadata check keys, used for skipped results on metadata failure
+NON_META_CHECK_KEYS = [
+    "quality_avg_brightness",
+    "quality_brightness_stability",
+    "quality_near_black_frames",
+    "luminance_blur",
+    "motion_camera_stability",
+    "motion_frozen_segments",
+    "ml_face_presence",
+    "ml_participants",
+    "ml_hand_visibility",
+    "ml_hand_object_interaction",
+    "ml_privacy_safety",
+    "ml_view_obstruction",
+    "ml_pov_hand_angle",
+]
+
+
 @dataclass
 class PipelineConfig:
-    """Configuration for the ML check pipeline."""
+    """Configuration for the full validation pipeline."""
     # Frame sampling
     sampling_fps: float = 1.0
     max_frames: int | None = None
@@ -35,10 +67,9 @@ class PipelineConfig:
     scrfd_root: str = "ml_checks/models/weights/insightface"
     yolo_model: str = "yolo11m.pt"
     hand_detector_repo: str = "ml_checks/models/weights/hands23_detector"
-    # Legacy Hands23: "ml_checks/models/weights/hand_object_detector"
     gdino_cache: str = "ml_checks/models/weights/grounding_dino"
 
-    # Thresholds
+    # ML thresholds
     face_confidence_threshold: float = 0.8
     person_confidence_threshold: float = 0.4
     hand_confidence_threshold: float = 0.7
@@ -59,9 +90,23 @@ class PipelineConfig:
         "paper document . credit card . ID card . identification card . bank card"
     )
 
+    # Frame quality thresholds
+    min_avg_brightness: float = 40.0
+    max_brightness_std: float = 60.0
+    min_pixel_mean: float = 10.0
 
-class MLCheckPipeline:
-    """Unified pipeline that loads all models once and runs all 7 checks."""
+    # Motion thresholds
+    camera_stability_threshold_px: float = 15.0
+    camera_stability_pass_rate: float = 0.80
+    frozen_max_consecutive: int = 30
+    frozen_ssim_threshold: float = 0.99
+
+    # Luminance & blur
+    luminance_blur_min_good_ratio: float = 0.80
+
+
+class ValidationPipeline:
+    """Unified pipeline that runs metadata, quality, motion, and ML checks."""
 
     def __init__(self, config: PipelineConfig | None = None):
         self.config = config or PipelineConfig()
@@ -82,19 +127,12 @@ class MLCheckPipeline:
         self.yolo_detector = YOLODetector(model_path=self.config.yolo_model)
         print("  YOLO11m loaded")
 
-        # 3. Hands23 hand-object detector (NeurIPS 2023)
+        # 3. Hands23 hand-object detector
         from ml_checks.models.hand_detector import HandObjectDetectorHands23
         self.hand_detector = HandObjectDetectorHands23(
             repo_dir=self.config.hand_detector_repo,
         )
         print("  Hands23 loaded")
-
-        # Legacy 100DOH (uncomment to revert):
-        # from ml_checks.models.hand_detector_100doh import HandObjectDetector100DOH
-        # self.hand_detector = HandObjectDetector100DOH(
-        #     repo_dir="ml_checks/models/weights/hand_object_detector",
-        # )
-        # print("  100DOH loaded")
 
         # 4. Grounding DINO (optional, for privacy)
         self.gdino_detector = None
@@ -110,41 +148,105 @@ class MLCheckPipeline:
         self._models_loaded = True
 
     def process_video(self, video_path: str | Path) -> dict[str, CheckResult]:
-        """Run all 7 ML checks on a video.
-
-        Args:
-            video_path: Path to the video file.
+        """Run all validation checks on a video.
 
         Returns:
             Dict mapping check name to CheckResult.
+            Keys are prefixed by category: meta_*, quality_*, luminance_blur,
+            motion_*, ml_*.
         """
-        if not self._models_loaded:
-            self.load_models()
-
         video_path = str(video_path)
         results = {}
         timings = {}
 
-        # Step 1: Extract frames
+        # ── Step 1: Metadata checks (short-circuit gate) ──────────
         t0 = time.perf_counter()
-        frames, meta = extract_frames(
+        metadata = get_video_metadata(video_path)
+        meta_results = run_all_metadata_checks(metadata)
+        timings["metadata"] = time.perf_counter() - t0
+        results.update(meta_results)
+
+        print(f"Metadata checks ({timings['metadata']:.2f}s):")
+        for name, r in meta_results.items():
+            print(f"  {name:<25} {r.status:>4}")
+
+        # If any metadata check fails, skip all other checks
+        meta_failed = any(r.status == "fail" for r in meta_results.values())
+        if meta_failed:
+            print("  Metadata check FAILED -- skipping all other checks")
+            for key in NON_META_CHECK_KEYS:
+                results[key] = CheckResult(
+                    status="skipped",
+                    metric_value=0.0,
+                    confidence=1.0,
+                    details={"reason": "metadata check failed"},
+                )
+            return results
+
+        # ── Step 2: Extract sampled frames ────────────────────────
+        t0 = time.perf_counter()
+        frames, frame_meta = extract_frames(
             video_path,
             fps=self.config.sampling_fps,
             max_frames=self.config.max_frames,
         )
         timings["frame_extraction"] = time.perf_counter() - t0
-        frame_h, frame_w = meta["height"], meta["width"]
+        frame_h, frame_w = frame_meta["height"], frame_meta["width"]
 
-        print(f"Extracted {len(frames)} frames ({meta['duration_s']}s video) in {timings['frame_extraction']:.2f}s")
+        print(f"Extracted {len(frames)} frames ({frame_meta['duration_s']}s video) "
+              f"in {timings['frame_extraction']:.2f}s")
 
-        # Step 2: Run all models per frame
+        # ── Step 3: Frame quality checks ──────────────────────────
+        t0 = time.perf_counter()
+        results["quality_avg_brightness"] = check_average_brightness(
+            frames, min_brightness=self.config.min_avg_brightness,
+        )
+        results["quality_brightness_stability"] = check_brightness_stability(
+            frames, max_std_dev=self.config.max_brightness_std,
+        )
+        results["quality_near_black_frames"] = check_near_black_frames(
+            frames, min_pixel_mean=self.config.min_pixel_mean,
+        )
+        timings["frame_quality"] = time.perf_counter() - t0
+        print(f"Frame quality checks ({timings['frame_quality']:.2f}s)")
+
+        # ── Step 4: Luminance & blur ──────────────────────────────
+        t0 = time.perf_counter()
+        lb_config = LuminanceBlurConfig(min_good_ratio=self.config.luminance_blur_min_good_ratio)
+        results["luminance_blur"] = check_luminance_blur(frames, config=lb_config)
+        timings["luminance_blur"] = time.perf_counter() - t0
+        print(f"Luminance & blur check ({timings['luminance_blur']:.2f}s)")
+
+        # ── Step 5: Motion analysis ───────────────────────────────
+        t0 = time.perf_counter()
+        results["motion_camera_stability"] = check_camera_stability(
+            frames,
+            threshold_px=self.config.camera_stability_threshold_px,
+            pass_rate=self.config.camera_stability_pass_rate,
+        )
+        timings["camera_stability"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        results["motion_frozen_segments"] = check_frozen_segments(
+            video_path,
+            max_consecutive=self.config.frozen_max_consecutive,
+            ssim_threshold=self.config.frozen_ssim_threshold,
+        )
+        timings["frozen_segments"] = time.perf_counter() - t0
+        print(f"Motion analysis ({timings['camera_stability']:.2f}s stability, "
+              f"{timings['frozen_segments']:.2f}s frozen)")
+
+        # ── Step 6: ML model inference ────────────────────────────
+        if not self._models_loaded:
+            self.load_models()
+
         per_frame_faces = []
         per_frame_yolo = []
         per_frame_yolo_persons = []
         per_frame_yolo_sensitive = []
         per_frame_hands = []
         per_frame_objects = []
-        flagged_for_gdino = []  # Frame indices that need Grounding DINO
+        flagged_for_gdino = []
 
         from ml_checks.models.yolo_detector import PERSON_CLASS, SENSITIVE_CLASSES
 
@@ -153,13 +255,11 @@ class MLCheckPipeline:
         t_hands23 = 0
 
         for i, frame in enumerate(frames):
-            # SCRFD face detection
             t0 = time.perf_counter()
             faces = self.face_detector.detect(frame)
             t_scrfd += time.perf_counter() - t0
             per_frame_faces.append(faces)
 
-            # YOLO detection
             t0 = time.perf_counter()
             yolo_dets = self.yolo_detector.detect(frame)
             t_yolo += time.perf_counter() - t0
@@ -170,7 +270,6 @@ class MLCheckPipeline:
             if sensitive:
                 flagged_for_gdino.append(i)
 
-            # 100DOH hand-object detection
             t0 = time.perf_counter()
             hands, objects = self.hand_detector.detect(frame)
             t_hands23 += time.perf_counter() - t0
@@ -184,7 +283,7 @@ class MLCheckPipeline:
         timings["yolo"] = t_yolo
         timings["hands23"] = t_hands23
 
-        # Step 3: Grounding DINO on flagged frames (if enabled)
+        # Grounding DINO on flagged frames
         per_frame_gdino = [[] for _ in frames]
         t_gdino = 0
         if self.gdino_detector and flagged_for_gdino:
@@ -200,17 +299,15 @@ class MLCheckPipeline:
                 per_frame_gdino[idx] = gdino_dets
         timings["grounding_dino"] = t_gdino
 
-        # Step 4: Run all 7 checks
-        print("Running checks...")
+        # ── Step 7: ML checks ────────────────────────────────────
+        print("Running ML checks...")
 
-        # Check 1: Face Presence
-        results["face_presence"] = check_face_presence(
+        results["ml_face_presence"] = check_face_presence(
             per_frame_faces,
             confidence_threshold=self.config.face_confidence_threshold,
         )
 
-        # Check 2: Participants
-        results["participants"] = check_participants(
+        results["ml_participants"] = check_participants(
             per_frame_yolo_persons,
             per_frame_faces,
             per_frame_hands,
@@ -219,35 +316,30 @@ class MLCheckPipeline:
             person_conf_threshold=self.config.person_confidence_threshold,
         )
 
-        # Check 3: Hand Visibility
-        results["hand_visibility"] = check_hand_visibility(
+        results["ml_hand_visibility"] = check_hand_visibility(
             per_frame_hands,
             confidence_threshold=self.config.hand_confidence_threshold,
             pass_rate_threshold=self.config.hand_pass_rate,
         )
 
-        # Check 4: Hand-Object Interaction
-        results["hand_object_interaction"] = check_hand_object_interaction(
+        results["ml_hand_object_interaction"] = check_hand_object_interaction(
             per_frame_hands,
             pass_rate_threshold=self.config.interaction_pass_rate,
         )
 
-        # Check 5: Privacy Safety
-        results["privacy_safety"] = check_privacy_safety(
+        results["ml_privacy_safety"] = check_privacy_safety(
             per_frame_yolo_sensitive,
             per_frame_gdino if self.gdino_detector else None,
             yolo_conf_threshold=self.config.privacy_yolo_threshold,
             gdino_conf_threshold=self.config.privacy_gdino_threshold,
         )
 
-        # Check 6: View Obstruction
-        results["view_obstruction"] = check_view_obstruction(
+        results["ml_view_obstruction"] = check_view_obstruction(
             frames,
             max_obstructed_ratio=self.config.obstruction_max_ratio,
         )
 
-        # Check 7: POV-Hand Angle
-        results["pov_hand_angle"] = check_pov_hand_angle(
+        results["ml_pov_hand_angle"] = check_pov_hand_angle(
             per_frame_hands,
             frame_dims=(frame_h, frame_w),
             angle_threshold=self.config.angle_threshold,
@@ -255,24 +347,36 @@ class MLCheckPipeline:
             diagonal_fov_degrees=self.config.diagonal_fov_degrees,
         )
 
-        # Summary
+        # ── Summary ──────────────────────────────────────────────
         total_time = sum(timings.values())
         timings["total"] = total_time
 
         print(f"\nTiming breakdown:")
+        print(f"  Metadata:         {timings['metadata']:.2f}s")
         print(f"  Frame extraction: {timings['frame_extraction']:.2f}s")
+        print(f"  Frame quality:    {timings['frame_quality']:.2f}s")
+        print(f"  Luminance & blur: {timings['luminance_blur']:.2f}s")
+        print(f"  Camera stability: {timings['camera_stability']:.2f}s")
+        print(f"  Frozen segments:  {timings['frozen_segments']:.2f}s")
         print(f"  SCRFD:            {timings['scrfd']:.2f}s")
         print(f"  YOLO11m:          {timings['yolo']:.2f}s")
-        print(f"  Hands23:           {timings['hands23']:.2f}s")
+        print(f"  Hands23:          {timings['hands23']:.2f}s")
         print(f"  Grounding DINO:   {timings['grounding_dino']:.2f}s")
         print(f"  TOTAL:            {total_time:.2f}s")
 
         print(f"\nCheck results:")
         for name, result in results.items():
-            flag = " ⚠️" if result.confidence < 0.7 and result.status == "pass" else ""
-            print(f"  {name:<30} {result.status:>4}  metric={result.metric_value:.4f}  conf={result.confidence:.4f}{flag}")
+            flag = ""
+            if result.status == "pass" and result.confidence < 0.7:
+                flag = " (low confidence)"
+            print(f"  {name:<35} {result.status:>7}  "
+                  f"metric={result.metric_value:.4f}  conf={result.confidence:.4f}{flag}")
 
         return results
+
+
+# Backward compatibility alias
+MLCheckPipeline = ValidationPipeline
 
 
 if __name__ == "__main__":
@@ -282,9 +386,9 @@ if __name__ == "__main__":
 
     config = PipelineConfig(
         sampling_fps=1.0,
-        max_frames=10,  # Limit for quick testing
+        max_frames=10,
         run_grounding_dino=True,
     )
 
-    pipeline = MLCheckPipeline(config)
+    pipeline = ValidationPipeline(config)
     results = pipeline.process_video(video_path)

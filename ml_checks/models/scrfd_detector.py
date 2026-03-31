@@ -26,13 +26,22 @@ class SCRFDDetector:
         det_size: tuple[int, int] = (640, 640),
     ):
         from insightface.app import FaceAnalysis
+        import onnxruntime
+
+        available = set(onnxruntime.get_available_providers())
+        if "CUDAExecutionProvider" in available:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            ctx_id = 0
+        else:
+            providers = ["CPUExecutionProvider"]
+            ctx_id = -1
 
         self.app = FaceAnalysis(
             name=model_name,
             root=str(root),
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
-        self.app.prepare(ctx_id=-1, det_size=det_size)
+        self.app.prepare(ctx_id=ctx_id, det_size=det_size)
 
     def detect(self, frame_bgr: np.ndarray) -> list[FaceDetection]:
         """Detect faces in a BGR frame.

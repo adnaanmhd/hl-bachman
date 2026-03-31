@@ -1,6 +1,6 @@
-# ML Checks: Research, Model Selection & Implementation Context
+# Video Validation Pipeline: Research, Model Selection & Implementation Context
 
-**Date:** 2026-03-30
+**Date:** 2026-03-30 (updated 2026-03-31)
 **Project:** Bachman — Egocentric Video Validation & Submission Tool
 **Author:** Adnaan (PM, Humyn Labs) + Claude Code
 
@@ -8,24 +8,33 @@
 
 ## 1. Problem & Purpose
 
-Humyn Labs is building an egocentric video dataset for **training autonomous humanoid robots**. Videos are captured by a distributed workforce wearing head-mounted cameras while performing agricultural, commercial, and residential tasks. The ML checks pipeline validates video quality before data enters the training pipeline.
+Humyn Labs is building an egocentric video dataset for **training autonomous humanoid robots**. Videos are captured by a distributed workforce wearing head-mounted cameras while performing agricultural, commercial, and residential tasks. The validation pipeline checks video quality across 18 criteria before data enters the training pipeline.
 
 **Scale:** ~5,000 videos/day, each ~500MB, 5+ minutes, 1080p, 30FPS.
 **Target:** <5 min total processing per video.
 
+The pipeline validates 5 categories of checks:
+1. **Video Metadata** (6 checks) — format, encoding, resolution, frame rate, duration, orientation. Acts as a gate: failure skips all other checks.
+2. **Frame-Level Quality** (3 checks) — average brightness, brightness stability, near-black frames.
+3. **Luminance & Blur** (1 check) — per-frame Tenengrad/luminance classification with segment-level aggregation.
+4. **Motion Analysis** (2 checks) — camera stability via Farneback optical flow, frozen segments via native-FPS SSIM.
+5. **ML Detection** (7 checks) — face presence, participants, hand visibility, hand-object interaction, privacy safety, view obstruction, POV-hand angle.
+
+See [checks.md](../checks.md) for full acceptance conditions and thresholds.
+
 ---
 
-## 2. The 7 ML Checks
+## 2. The 7 ML Detection Checks
 
 | # | Check | Criterion | Model |
 |---|---|---|---|
 | 1 | Face Presence | Face detection confidence < 0.8 in ALL frames | SCRFD-2.5GF |
 | 2 | Participants | 0 other persons (face or body parts) in ≥ 95% frames | YOLO11m + SCRFD |
-| 3 | Hand Visibility | Both hands detected (≥ 0.7 conf) in ≥ 90% frames | 100DOH |
-| 4 | Hand-Object Interaction | Interaction detected in ≥ 70% frames | 100DOH (contact state) |
+| 3 | Hand Visibility | Both hands detected (≥ 0.7 conf) in ≥ 90% frames | Hands23 |
+| 4 | Hand-Object Interaction | Interaction detected in ≥ 70% frames | Hands23 (contact state) |
 | 5 | Privacy Safety | Sensitive objects = 0 in ALL frames | YOLO11m pre-filter + Grounding DINO zero-shot |
 | 6 | View Obstruction | ≤ 10% frames obstructed | OpenCV heuristic (no ML) |
-| 7 | POV-Hand Angle | Angle from center to hands < 40° in ≥ 80% frames | Geometric computation on 100DOH output |
+| 7 | POV-Hand Angle | Angle from center to hands < 40° in ≥ 80% frames | Geometric computation on Hands23 output |
 
 ---
 
@@ -49,18 +58,25 @@ Humyn Labs is building an egocentric video dataset for **training autonomous hum
 #### YOLO11m (Person/Object Detection — Checks 2, 5)
 - **Why YOLO11m over nano:** 51.5 vs 39.5 mAP on COCO. Person detection is safety-critical (false negatives = missed people in privacy-sensitive data). 22% fewer params than YOLOv8m with higher accuracy.
 - **Why not RT-DETR:** Heavier for comparable accuracy, less mature deployment ecosystem.
-- **Egocentric note:** Camera wearer is invisible but their arms/hands appear. Pipeline filters out wearer's own body parts by checking overlap with 100DOH hand detections and bottom-center frame position.
+- **Egocentric note:** Camera wearer is invisible but their arms/hands appear. Pipeline filters out wearer's own body parts by checking overlap with Hands23 hand detections and bottom-center frame position.
 - **Package:** `ultralytics`
 - **Speed:** ~88ms/frame CPU
 
-#### 100DOH hand_object_detector (Hand Detection — Checks 3, 4, 7)
-- **Why over MediaPipe:** MediaPipe Hand Landmarker has documented AP50 of 29-97% on egocentric data (wildly inconsistent). The 100DOH "100K+ego" model was **trained specifically on egocentric hand images** from 131 days of real-world footage. 90.46% Box AP.
+#### Hands23 (Hand Detection — Checks 3, 4, 7) [Default]
+- **Why Hands23 over 100DOH:** NeurIPS 2023 successor to 100DOH. Trained on 250K images including EPIC-KITCHENS and VISOR egocentric datasets. No custom C++ compilation needed (pure Detectron2). ~3.5x faster than 100DOH on CPU.
+- **Why over MediaPipe:** MediaPipe Hand Landmarker has documented AP50 of 29-97% on egocentric data (wildly inconsistent). Hands23 was **trained specifically on egocentric hand images**.
 - **Why not HaMeR:** ViT-H backbone (~630M params, ~200-500ms/frame GPU) is overkill for "are hands visible?" detection. HaMeR reconstructs full 3D mesh — we only need bounding boxes + confidence + contact state.
 - **Key advantage:** Returns hand contact state (N/S/O/P/F) directly — eliminates need for crude bounding-box overlap heuristic for hand-object interaction detection.
 - **Contact states:** N=no contact, S=self, O=other person, P=portable object, F=stationary object. States P and F = interaction.
-- **Architecture:** Faster R-CNN with ResNet-101 backbone, custom heads for contact state and hand side classification.
-- **Package:** Custom repo (`github.com/ddshan/hand_object_detector`) + `detectron2` (not actually used, compiled C++ extensions from the repo directly)
-- **Speed:** ~5,141ms/frame CPU, **expected ~100-150ms/frame on GPU**
+- **Architecture:** Faster R-CNN with X-101-FPN backbone, custom heads for contact state, hand side, and grasp type classification.
+- **Package:** Custom repo (`github.com/EvaCheng-cty/hands23_detector`) + `detectron2`
+- **Speed:** ~1,400ms/frame CPU, **expected ~100-200ms/frame on GPU**
+
+#### 100DOH hand_object_detector (Hand Detection — Legacy)
+- **Predecessor to Hands23.** Trained on 131 days of real-world egocentric footage. 90.46% Box AP.
+- Requires custom C++ extension compilation (fragile across Python/PyTorch versions).
+- **Speed:** ~5,141ms/frame CPU (~3.5x slower than Hands23).
+- Available via `./validate.sh --100doh` or `python ml_checks/models/download_models.py --100doh`.
 
 #### Grounding DINO (Privacy — Check 5, second stage)
 - **Why:** Zero-shot detection of arbitrary text-described objects ("credit card", "ID card", "paper document") without any fine-tuning or training data. 52.5 AP zero-shot on COCO — SOTA.
@@ -124,7 +140,7 @@ This dataset is directly analogous to **Ego4D** (Meta's 3,670-hour egocentric vi
 | Daily cost (spot) | ~$29 | ~$139 |
 | Monthly cost | ~$870 | ~$4,170 |
 
-**GPU is ~4.8x more cost-effective at scale.** The 100DOH model is the bottleneck — it's ~5s/frame on CPU vs ~100-150ms expected on A10G GPU (~35-50x speedup).
+**GPU is ~4.8x more cost-effective at scale.** Hands23 is the bottleneck — it's ~1.4s/frame on CPU vs ~100-200ms expected on A10G GPU. (Legacy 100DOH was ~5s/frame CPU.)
 
 **Recommended AWS architecture:** ECS on g5.xlarge (A10G) with Celery workers. Single container with all 4 models in GPU memory (~1.1GB model weights, ~3-4GB total GPU memory). A10G has 24GB — plenty of headroom. Spot instances at ~$0.30-0.50/hr.
 
@@ -180,16 +196,23 @@ After patching, compiled with `python setup.py build develop --no-build-isolatio
 
 ```
 Video file
+  → Metadata checks (ffprobe, no frames needed)
+  → IF metadata fails: return metadata results + SKIPPED for all others
   → Frame extraction (cv2.VideoCapture, 1 FPS)
-  → Per frame:
+  → Frame-level quality checks (brightness, stability, near-black)
+  → Luminance & blur check (Tenengrad + luminance decision table)
+  → Motion analysis:
+      - Camera stability (Farneback optical flow on sampled pairs)
+      - Frozen segments (SSIM at native FPS, streaming)
+  → Per frame (ML):
       1. SCRFD face detection (~10ms)
       2. YOLO11m object detection (~88ms)
-      3. 100DOH hand-object detection (~5s CPU / ~100ms GPU)
+      3. Hands23 hand-object detection (~1.4s CPU / ~100-200ms GPU)
       4. View obstruction heuristic (<1ms)
   → If YOLO flagged sensitive objects:
       5. Grounding DINO on flagged frames only (~2.8s/frame CPU)
-  → Distribute results to 7 check functions
-  → Aggregate results
+  → Distribute results to 7 ML check functions
+  → Aggregate all 18 check results
 ```
 
 ### Grounding DINO Two-Stage Approach
@@ -203,7 +226,7 @@ This reduces Grounding DINO from 300 frames (~14 min on CPU) to ~0-30 frames (~0
 ### Check 2 Participants — Wearer Filtering
 
 The camera wearer's arms/hands appear in frame but should NOT be counted as "another person." Filtering logic:
-1. Exclude YOLO person detections that overlap significantly with 100DOH hand detections (wearer's hands = wearer's arms)
+1. Exclude YOLO person detections that overlap significantly with Hands23 hand detections (wearer's hands = wearer's arms)
 2. Exclude detections anchored at bottom-center of frame (wearer's torso/arms)
 3. Require minimum person bbox height > 15% of frame height (filter tiny partial detections)
 4. Combine with SCRFD face detections — even a disembodied face with no body detection counts as "another person present"
@@ -213,41 +236,39 @@ The camera wearer's arms/hands appear in frame but should NOT be counted as "ano
 ## 9. Project Structure
 
 ```
-ml_checks/
-├── __init__.py
-├── pipeline.py                     # Unified inference pipeline
-├── requirements.txt
-├── checks/
-│   ├── __init__.py
-│   ├── check_results.py            # CheckResult dataclass
-│   ├── face_presence.py            # Check 1
-│   ├── participants.py             # Check 2
-│   ├── hand_visibility.py          # Check 3
-│   ├── hand_object_interaction.py  # Check 4
-│   ├── privacy_safety.py           # Check 5
-│   ├── view_obstruction.py         # Check 6
-│   └── pov_hand_angle.py           # Check 7
-├── models/
-│   ├── __init__.py
-│   ├── download_models.py
-│   ├── scrfd_detector.py           # SCRFD wrapper
-│   ├── yolo_detector.py            # YOLO11m wrapper
-│   ├── hand_detector.py            # 100DOH wrapper
-│   ├── grounding_dino_detector.py  # Grounding DINO wrapper
-│   └── weights/
-│       ├── insightface/            # SCRFD model (~14MB)
-│       ├── grounding_dino/         # Grounding DINO (~700MB)
-│       └── hand_object_detector/   # 100DOH repo + weights (~360MB)
-├── utils/
-│   ├── __init__.py
-│   └── frame_extractor.py
-├── tests/
-│   ├── __init__.py
-│   ├── generate_test_video.py
-│   ├── benchmark_models.py
-│   └── benchmark_results.json
-└── sample_data/
-    └── test_30s.mp4                # Synthetic test video
+hl-bachman/
+├── validate.sh                         # One-command entry point
+├── pyproject.toml                      # Package configuration (hl-video-validation)
+├── checks.md                           # Check specifications and thresholds
+├── README.md
+└── ml_checks/
+    ├── __init__.py
+    ├── pipeline.py                     # ValidationPipeline orchestrator
+    ├── run_batch.py                    # CLI entry point (hl-validate)
+    ├── CONTEXT.md                      # This file
+    ├── checks/
+    │   ├── check_results.py            # CheckResult dataclass
+    │   ├── video_metadata.py           # 6 metadata checks
+    │   ├── frame_quality.py            # 3 brightness checks
+    │   ├── luminance_blur.py           # Tenengrad + luminance decision table
+    │   ├── motion_analysis.py          # Optical flow + frozen segment detection
+    │   ├── face_presence.py            # Face detection check
+    │   ├── participants.py             # Person count check
+    │   ├── hand_visibility.py          # Hand detection check
+    │   ├── hand_object_interaction.py  # Contact state check
+    │   ├── privacy_safety.py           # Sensitive object detection
+    │   ├── view_obstruction.py         # Lens obstruction heuristic
+    │   └── pov_hand_angle.py           # Hand angle check
+    ├── models/
+    │   ├── download_models.py          # Model weight downloader
+    │   ├── scrfd_detector.py           # SCRFD face detector
+    │   ├── yolo_detector.py            # YOLO11m object detector
+    │   ├── hand_detector.py            # Hands23 hand-object detector
+    │   ├── grounding_dino_detector.py  # Zero-shot privacy detector
+    │   └── weights/                    # ~1.5GB, downloaded on first run
+    └── utils/
+        ├── frame_extractor.py          # Video frame sampling
+        └── video_metadata.py           # FFprobe metadata extraction
 ```
 
 **YOLO11m weights** (`yolo11m.pt`) are downloaded by ultralytics to its default cache (~40MB).
@@ -270,7 +291,7 @@ Pillow>=10.0
 tqdm>=4.65
 ```
 
-**Special:** 100DOH requires `faster-rcnn` package built from source (`hand_object_detector/lib/setup.py build develop`). Detectron2 installed but not directly used by 100DOH (it has its own Faster R-CNN implementation).
+**Special:** Hands23 requires `detectron2` (installed from GitHub with `--no-build-isolation`). Legacy 100DOH additionally requires C++ extensions built from source. System dependency: `ffmpeg`/`ffprobe` for video metadata extraction. All handled automatically by `validate.sh`.
 
 ---
 
@@ -304,15 +325,17 @@ tqdm>=4.65
 | Decision | Rationale |
 |---|---|
 | GPU over CPU at scale | 4.8x more cost-effective ($870 vs $4,170/month) |
-| 100DOH over MediaPipe for hands | MediaPipe has 29-97% AP on egocentric data; 100DOH has 90.4% trained on egocentric |
+| Hands23 over 100DOH | NeurIPS 2023 successor, 250K training images, no C++ compilation, ~3.5x faster on CPU |
+| Hands23 over MediaPipe for hands | MediaPipe has 29-97% AP on egocentric data; Hands23 trained on egocentric datasets |
 | SCRFD over MediaPipe for faces | 93.8% AP on WIDER hard set; MediaPipe optimized for webcam |
 | Grounding DINO over fine-tuned YOLO for privacy | Zero-shot capability for arbitrary sensitive objects without training data |
 | Two-stage privacy (YOLO pre-filter + GDINO) | Reduces GDINO from 300 to ~15 frames, cutting cost by 95% |
-| 100DOH over Ego4D HOI models | Ego4D models solve temporal localization, not frame-level interaction detection |
-| 100DOH over EgoHOS | EgoHOS provides pixel segmentation — overkill for binary interaction signal |
 | Heuristic over ML for view obstruction | No standard ML model exists; signal is fundamentally low-level |
 | YOLO11m over YOLO11n | 51.5 vs 39.5 mAP; person detection is safety-critical for privacy |
-| 1 FPS sampling | 300 frames gives sufficient temporal coverage; configurable for GPU |
+| Metadata gate (short-circuit) | Avoids expensive ML inference on videos that fail basic format/duration requirements |
+| Farneback over Lucas-Kanade for stability | Dense optical flow gives more accurate camera motion estimate |
+| Native FPS for frozen segments | 30 consecutive frames = 1 second; sampled frames would miss short freezes |
+| 1 FPS sampling for ML checks | 120 frames gives sufficient temporal coverage; configurable for GPU |
 
 ---
 

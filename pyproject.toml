@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hl-video-validation"
+version = "0.1.0"
+description = "Egocentric video validation pipeline for humanoid robot training datasets"
+requires-python = ">=3.11,<3.14"
+
+# NOTE: torch, torchvision, onnxruntime, and detectron2 are intentionally
+# excluded. They require platform-specific install (CPU vs CUDA) and are
+# handled by validate.sh before this package is installed.
+dependencies = [
+    "insightface>=0.7.3",
+    "ultralytics>=8.1.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0",
+    "tqdm>=4.65",
+    "gdown>=5.0",
+    "transformers>=4.36.0",
+    "supervision>=0.18.0",
+    "easydict",
+    "scipy",
+    "pyyaml",
+    "cython",
+]
+
+[project.scripts]
+hl-validate = "ml_checks.run_batch:main"
+
+[tool.setuptools.packages.find]
+include = ["ml_checks*"]

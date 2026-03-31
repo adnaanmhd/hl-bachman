@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run the ML check pipeline on a batch of videos.
+"""Run the validation pipeline on a batch of videos.
 
 Usage:
     # Single video
@@ -13,9 +13,6 @@ Usage:
 
     # With options
     python -m ml_checks.run_batch /path/to/videos/ --fps 2 --max-frames 50 --no-gdino --output results/
-
-    # Auto-rotate portrait videos to landscape before processing
-    python -m ml_checks.run_batch /path/to/videos/ --auto-rotate
 """
 
 import argparse
@@ -23,8 +20,6 @@ import json
 import os
 import sys
 import time
-import subprocess
-import tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -32,96 +27,54 @@ from datetime import datetime
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-import cv2
-import numpy as np
-
-from ml_checks.pipeline import MLCheckPipeline, PipelineConfig
-from ml_checks.utils.frame_extractor import extract_frames
+from ml_checks.pipeline import ValidationPipeline, PipelineConfig
+from ml_checks.utils.video_metadata import get_video_metadata
 
 
-def get_video_meta(path: str) -> dict:
-    """Get video metadata without loading the full file."""
-    cap = cv2.VideoCapture(path)
-    meta = {
-        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        "fps": round(cap.get(cv2.CAP_PROP_FPS), 2),
-        "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-        "duration_s": round(
-            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / max(cap.get(cv2.CAP_PROP_FPS), 1), 2
-        ),
-        "file_size_mb": round(os.path.getsize(path) / 1024 / 1024, 1),
-    }
-    cap.release()
-    return meta
+# Check display names grouped by category
+CHECK_CATEGORIES = [
+    ("Video Metadata", [
+        ("meta_format", "Format"),
+        ("meta_encoding", "Encoding"),
+        ("meta_resolution", "Resolution"),
+        ("meta_frame_rate", "Frame Rate"),
+        ("meta_duration", "Duration"),
+        ("meta_orientation", "Orientation"),
+    ]),
+    ("Frame-Level Quality", [
+        ("quality_avg_brightness", "Average Brightness"),
+        ("quality_brightness_stability", "Brightness Stability"),
+        ("quality_near_black_frames", "Near-Black Frames"),
+    ]),
+    ("Luminance & Blur", [
+        ("luminance_blur", "Luminance & Blur"),
+    ]),
+    ("Motion Analysis", [
+        ("motion_camera_stability", "Camera Stability"),
+        ("motion_frozen_segments", "Frozen Segments"),
+    ]),
+    ("ML Detection", [
+        ("ml_face_presence", "Face Presence"),
+        ("ml_participants", "Participants"),
+        ("ml_hand_visibility", "Hand Visibility"),
+        ("ml_hand_object_interaction", "Hand-Object Interaction"),
+        ("ml_privacy_safety", "Privacy Safety"),
+        ("ml_view_obstruction", "View Obstruction"),
+        ("ml_pov_hand_angle", "POV-Hand Angle"),
+    ]),
+]
 
 
-def check_rotation(path: str) -> int:
-    """Check if video has a rotation metadata tag. Returns degrees (0, 90, 180, 270)."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
-            capture_output=True, text=True,
-        )
-        data = json.loads(result.stdout)
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video":
-                # Check tags
-                rotation = stream.get("tags", {}).get("rotate", "0")
-                if rotation != "0":
-                    return abs(int(rotation))
-                # Check side_data_list
-                for sd in stream.get("side_data_list", []):
-                    if "rotation" in sd:
-                        return abs(int(sd["rotation"]))
-    except Exception:
-        pass
-    return 0
-
-
-def rotate_video(input_path: str, output_path: str, rotation: int) -> str:
-    """Rotate video to correct orientation using ffmpeg."""
-    # Map rotation to ffmpeg transpose value
-    # rotation = degrees the video is rotated FROM upright
-    if rotation == 90:
-        vf = "transpose=1"  # 90° clockwise
-    elif rotation == 270:
-        vf = "transpose=2"  # 90° counter-clockwise
-    elif rotation == 180:
-        vf = "rotate=PI"
-    else:
-        return input_path  # No rotation needed
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", input_path, "-vf", vf,
-         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-an", output_path],
-        capture_output=True,
-    )
-    return output_path
-
-
-def is_portrait(path: str) -> bool:
-    """Check if video displays as portrait (accounting for rotation metadata)."""
-    meta = get_video_meta(path)
-    rotation = check_rotation(path)
-    w, h = meta["width"], meta["height"]
-    # If rotated 90 or 270, the display dimensions are swapped
-    if rotation in (90, 270):
-        w, h = h, w
-    return h > w
-
-
-def collect_videos(paths: list[str], extensions: set[str] = {".mp4", ".mov", ".avi", ".mkv"}) -> list[Path]:
-    """Collect video files from paths (files or directories)."""
+def collect_videos(paths: list[str]) -> list[Path]:
+    """Collect .mp4 video files from paths (files or directories)."""
     videos = []
     for p in paths:
         path = Path(p)
-        if path.is_file() and path.suffix.lower() in extensions:
+        if path.is_file() and path.suffix.lower() == ".mp4":
             videos.append(path)
         elif path.is_dir():
-            for ext in extensions:
-                videos.extend(sorted(path.glob(f"*{ext}")))
-                videos.extend(sorted(path.glob(f"*{ext.upper()}")))
+            videos.extend(sorted(path.glob("*.mp4")))
+            videos.extend(sorted(path.glob("*.MP4")))
     # Deduplicate preserving order
     seen = set()
     unique = []
@@ -133,11 +86,75 @@ def collect_videos(paths: list[str], extensions: set[str] = {".mp4", ".mov", ".a
     return unique
 
 
-def format_result_row(name: str, result) -> str:
-    """Format a single check result as a markdown table row."""
-    status_icon = "PASS" if result.status == "pass" else "FAIL"
-    flag = " (flagged)" if result.confidence < 0.7 and result.status == "pass" else ""
-    return f"| {name} | **{status_icon}** | {result.metric_value:.4f} | {result.confidence:.4f}{flag} |"
+def _status_icon(status: str) -> str:
+    """Map status string to display label."""
+    return {
+        "pass": "PASS",
+        "fail": "FAIL",
+        "review": "REVIEW",
+        "skipped": "SKIPPED",
+    }.get(status, status.upper())
+
+
+# Acceptance conditions and actual-value extractors per check key
+ACCEPTANCE_CONDITIONS = {
+    "meta_format": "MP4 container (MPEG-4)",
+    "meta_encoding": "H.264 video codec",
+    "meta_resolution": ">= 1920 x 1080 pixels",
+    "meta_frame_rate": ">= 28 FPS",
+    "meta_duration": ">= 60 seconds",
+    "meta_orientation": "Rotation = 0 or 180 degrees and width > height",
+    "quality_avg_brightness": "Mean grayscale intensity >= 40",
+    "quality_brightness_stability": "Std dev <= 60 across frames",
+    "quality_near_black_frames": "Mean pixel >= 10 in all frames",
+    "luminance_blur": "(Accept + review) frames >= 80% of total",
+    "motion_camera_stability": "Mean optical flow <= 15 px in >= 80% frame pairs",
+    "motion_frozen_segments": "No > 30 consecutive frames with SSIM > 0.99",
+    "ml_face_presence": "Face detection confidence < 0.8 in all frames",
+    "ml_participants": "Persons detected <= 1 in >= 95% frames",
+    "ml_hand_visibility": ">= 90% frames with both hands confidence >= 0.7",
+    "ml_hand_object_interaction": "Interaction detected in >= 70% frames",
+    "ml_privacy_safety": "Sensitive object detections = 0 in all frames",
+    "ml_view_obstruction": "<= 10% frames obstructed",
+    "ml_pov_hand_angle": "Hands within 40 deg of center in >= 80% frames",
+}
+
+
+def _format_actual(key: str, details: dict) -> str:
+    """Extract a human-readable actual result from a check's details dict."""
+    if not details:
+        return "-"
+    d = details
+
+    formatters = {
+        "meta_format": lambda: d.get("container_format", "-"),
+        "meta_encoding": lambda: d.get("video_codec", "-"),
+        "meta_resolution": lambda: f"{d.get('width', '?')} x {d.get('height', '?')}",
+        "meta_frame_rate": lambda: f"{d.get('fps', '?')} FPS",
+        "meta_duration": lambda: f"{d.get('duration_s', '?')}s",
+        "meta_orientation": lambda: f"rotation={d.get('rotation', '?')}, {d.get('width', '?')} x {d.get('height', '?')}",
+        "quality_avg_brightness": lambda: f"Mean = {d.get('mean_brightness', '?')} (range {d.get('per_frame_min', '?')}-{d.get('per_frame_max', '?')})",
+        "quality_brightness_stability": lambda: f"Std dev = {d.get('brightness_std_dev', '?')}",
+        "quality_near_black_frames": lambda: f"{d.get('near_black_frames', '?')} near-black frames out of {d.get('total_frames', '?')}",
+        "luminance_blur": lambda: f"{d.get('good_ratio', 0):.0%} good ({d.get('accept_frames', 0)} accept + {d.get('review_frames', 0)} review + {d.get('reject_frames', 0)} reject)",
+        "motion_camera_stability": lambda: f"{d.get('stable_ratio', 0):.0%} stable pairs (mean flow = {d.get('mean_flow_magnitude', '?')} px, max = {d.get('max_flow_magnitude', '?')} px)",
+        "motion_frozen_segments": lambda: f"Longest frozen run = {d.get('longest_frozen_run', '?')} frames ({d.get('frozen_duration_s', '?')}s)",
+        "ml_face_presence": lambda: f"{d.get('frames_with_prominent_face', '?')} frames with face >= 0.8 (max conf = {d.get('max_face_confidence_seen', '?')})",
+        "ml_participants": lambda: f"{d.get('clean_frames', '?')}/{d.get('total_frames', '?')} clean frames ({d.get('clean_frames', 0) / max(d.get('total_frames', 1), 1):.1%})",
+        "ml_hand_visibility": lambda: f"{d.get('both_hands_frames', '?')}/{d.get('total_frames', '?')} frames with both hands ({d.get('both_hands_frames', 0) / max(d.get('total_frames', 1), 1):.1%})",
+        "ml_hand_object_interaction": lambda: f"{d.get('interaction_frames', '?')}/{d.get('total_frames', '?')} frames with interaction ({d.get('interaction_frames', 0) / max(d.get('total_frames', 1), 1):.1%})",
+        "ml_privacy_safety": lambda: f"{d.get('frames_with_sensitive_objects', '?')} frames with sensitive objects",
+        "ml_view_obstruction": lambda: f"{d.get('obstructed_frames', '?')}/{d.get('total_frames', '?')} obstructed ({d.get('obstructed_ratio', 0):.1%})",
+        "ml_pov_hand_angle": lambda: f"{d.get('passing_frames', '?')}/{d.get('total_frames', '?')} frames within angle (mean = {d.get('mean_angle', '?')} deg, max = {d.get('max_angle', '?')} deg)",
+    }
+
+    formatter = formatters.get(key)
+    if formatter:
+        try:
+            return formatter()
+        except Exception:
+            return str(d)
+    return str(d)
 
 
 def write_report(
@@ -145,96 +162,111 @@ def write_report(
     output_dir: Path,
     config: PipelineConfig,
 ):
-    """Write a markdown summary report for all processed videos."""
+    """Write a markdown batch report with detailed per-check results."""
     report_path = output_dir / "batch_report.md"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [
-        f"# Batch Pipeline Report",
-        f"",
-        f"**Generated:** {timestamp}",
-        f"**Videos processed:** {len(all_results)}",
-        f"**Sampling FPS:** {config.sampling_fps}",
+        "# Batch Pipeline Report",
+        "",
+        f"**Generated:** {timestamp}  ",
+        f"**Videos processed:** {len(all_results)}  ",
+        f"**Sampling FPS:** {config.sampling_fps}  ",
         f"**Grounding DINO:** {'enabled' if config.run_grounding_dino else 'disabled'}",
-        f"",
-        f"---",
-        f"",
+        "",
+        "---",
+        "",
     ]
 
-    # Summary table
+    # ── Summary table ─────────────────────────────────────────
     lines.append("## Summary")
     lines.append("")
-    lines.append("| Video | Checks Passed | Status | Processing Time |")
-    lines.append("|---|---|---|---|")
+    lines.append("| # | Video | Passed | Review | Failed | Skipped | Status | Time |")
+    lines.append("|---|---|---|---|---|---|---|---|")
 
-    for entry in all_results:
+    for idx, entry in enumerate(all_results, 1):
         name = entry["filename"]
         if "error" in entry:
-            lines.append(f"| {name} | - | ERROR: {entry['error']} | - |")
+            lines.append(f"| {idx} | {name} | - | - | - | - | ERROR | - |")
             continue
+
         checks = entry["results"]
         passed = sum(1 for r in checks.values() if r["status"] == "pass")
-        total = len(checks)
-        status = "ALL PASS" if passed == total else f"{passed}/{total}"
+        review = sum(1 for r in checks.values() if r["status"] == "review")
+        failed = sum(1 for r in checks.values() if r["status"] == "fail")
+        skipped = sum(1 for r in checks.values() if r["status"] == "skipped")
+
+        if failed > 0:
+            status = "FAIL"
+        elif review > 0:
+            status = "REVIEW"
+        elif skipped > 0:
+            status = "METADATA FAIL"
+        else:
+            status = "ALL PASS"
+
         proc_time = f"{entry['processing_time_s']:.1f}s"
-        lines.append(f"| {name} | {passed}/{total} | {status} | {proc_time} |")
+        lines.append(f"| {idx} | {name} | {passed} | {review} | {failed} | {skipped} | {status} | {proc_time} |")
 
     lines.append("")
     lines.append("---")
     lines.append("")
 
-    # Per-video detail
-    lines.append("## Per-Video Results")
-    lines.append("")
-
+    # ── Per-video detailed results ────────────────────────────
     for entry in all_results:
         name = entry["filename"]
-        lines.append(f"### {name}")
+        lines.append(f"## {name}")
         lines.append("")
 
         if "error" in entry:
             lines.append(f"**Error:** {entry['error']}")
             lines.append("")
+            lines.append("---")
+            lines.append("")
             continue
 
+        # Video info header
         meta = entry["video_meta"]
-        lines.append(f"- Resolution: {meta['width']}x{meta['height']}, {meta['fps']} FPS, {meta['duration_s']}s, {meta['file_size_mb']} MB")
-        if entry.get("rotated"):
-            lines.append(f"- Auto-rotated from portrait to landscape")
-        lines.append(f"- Frames sampled: {entry['frames_sampled']}")
-        lines.append(f"- Processing time: {entry['processing_time_s']:.1f}s")
+        lines.append(
+            f"**File:** {meta['file_size_mb']} MB | "
+            f"**Resolution:** {meta['width']}x{meta['height']} | "
+            f"**FPS:** {meta['fps']} | "
+            f"**Duration:** {meta['duration_s']}s | "
+            f"**Codec:** {meta['video_codec']} | "
+            f"**Rotation:** {meta['rotation']}"
+        )
+        lines.append(
+            f"**Frames sampled:** {entry.get('frames_sampled', 'N/A')} | "
+            f"**Processing time:** {entry['processing_time_s']:.1f}s"
+        )
         lines.append("")
 
-        lines.append("| Check | Status | Metric | Confidence |")
-        lines.append("|---|---|---|---|")
+        # Detailed check table grouped by category
+        for category_name, check_list in CHECK_CATEGORIES:
+            category_checks = [
+                (key, display) for key, display in check_list
+                if key in entry["results"]
+            ]
+            if not category_checks:
+                continue
 
-        check_names = [
-            ("face_presence", "Face Presence"),
-            ("participants", "Participants"),
-            ("hand_visibility", "Hand Visibility"),
-            ("hand_object_interaction", "Hand-Object Interaction"),
-            ("privacy_safety", "Privacy Safety"),
-            ("view_obstruction", "View Obstruction"),
-            ("pov_hand_angle", "POV-Hand Angle"),
-        ]
-
-        for key, display in check_names:
-            if key in entry["results"]:
-                r = entry["results"][key]
-                status_icon = "PASS" if r["status"] == "pass" else "FAIL"
-                flag = " (flagged)" if r["confidence"] < 0.7 and r["status"] == "pass" else ""
-                lines.append(f"| {display} | **{status_icon}** | {r['metric_value']:.4f} | {r['confidence']:.4f}{flag} |")
-
-        lines.append("")
-
-        # Details for failing checks
-        failing = {k: v for k, v in entry["results"].items() if v["status"] == "fail"}
-        if failing:
-            lines.append("**Failing checks:**")
+            lines.append(f"### {category_name}")
             lines.append("")
-            for key, r in failing.items():
-                display = dict(check_names).get(key, key)
-                lines.append(f"- **{display}**: {json.dumps(r['details'], default=str)}")
+            lines.append("| Check | Status | Acceptance Condition | Actual Result |")
+            lines.append("|---|---|---|---|")
+
+            for key, display in category_checks:
+                r = entry["results"][key]
+                status = _status_icon(r["status"])
+                acceptance = ACCEPTANCE_CONDITIONS.get(key, "-")
+
+                if r["status"] == "skipped":
+                    actual = "Skipped (metadata failed)"
+                else:
+                    actual = _format_actual(key, r.get("details", {}))
+
+                lines.append(f"| {display} | **{status}** | {acceptance} | {actual} |")
+
             lines.append("")
 
         lines.append("---")
@@ -245,25 +277,33 @@ def write_report(
     return report_path
 
 
+def _get_display_name(key: str) -> str:
+    """Look up display name for a check key."""
+    for _, checks in CHECK_CATEGORIES:
+        for k, display in checks:
+            if k == key:
+                return display
+    return key
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Run ML check pipeline on a batch of videos.",
+        description="Run validation pipeline on a batch of videos.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python -m ml_checks.run_batch video.mp4
   python -m ml_checks.run_batch videos_dir/
-  python -m ml_checks.run_batch *.mp4 --auto-rotate --output results/
+  python -m ml_checks.run_batch *.mp4 --output results/
   python -m ml_checks.run_batch videos/ --fps 2 --max-frames 100 --no-gdino
         """,
     )
-    parser.add_argument("paths", nargs="+", help="Video files or directories to process")
+    parser.add_argument("paths", nargs="+", help="Video files or directories to process (.mp4 only)")
     parser.add_argument("--output", "-o", default="ml_checks/results", help="Output directory for reports (default: ml_checks/results)")
     parser.add_argument("--fps", type=float, default=1.0, help="Frame sampling rate in FPS (default: 1.0)")
     parser.add_argument("--max-frames", type=int, default=None, help="Max frames to sample per video (default: no limit)")
     parser.add_argument("--no-gdino", action="store_true", help="Disable Grounding DINO (faster, but no fine-grained privacy detection)")
-    parser.add_argument("--auto-rotate", action="store_true", help="Auto-rotate portrait videos to landscape before processing")
-    parser.add_argument("--hand-detector-repo", default="ml_checks/models/weights/hands23_detector", help="Path to Hands23 repo (or 100DOH for legacy)")
+    parser.add_argument("--hand-detector-repo", default="ml_checks/models/weights/hands23_detector", help="Path to Hands23 repo")
     parser.add_argument("--scrfd-root", default="ml_checks/models/weights/insightface", help="Path to InsightFace models")
     parser.add_argument("--gdino-cache", default="ml_checks/models/weights/grounding_dino", help="Path to Grounding DINO cache")
 
@@ -272,7 +312,7 @@ Examples:
     # Collect videos
     videos = collect_videos(args.paths)
     if not videos:
-        print("No video files found.")
+        print("No .mp4 video files found.")
         sys.exit(1)
 
     print(f"Found {len(videos)} video(s) to process.")
@@ -293,13 +333,11 @@ Examples:
         gdino_cache=args.gdino_cache,
     )
 
-    # Load models once
-    pipeline = MLCheckPipeline(config)
-    pipeline.load_models()
+    # Initialize pipeline (models loaded lazily on first non-metadata-failing video)
+    pipeline = ValidationPipeline(config)
 
     # Process each video
     all_results = []
-    temp_files = []
 
     for i, video_path in enumerate(videos):
         print(f"\n{'='*70}")
@@ -312,37 +350,23 @@ Examples:
         }
 
         try:
-            # Get metadata
-            meta = get_video_meta(str(video_path))
-            entry["video_meta"] = meta
+            # Get metadata for report header
+            metadata = get_video_metadata(str(video_path))
+            entry["video_meta"] = metadata
 
-            # Auto-rotate if needed
-            process_path = str(video_path)
-            entry["rotated"] = False
-
-            if args.auto_rotate and is_portrait(str(video_path)):
-                rotation = check_rotation(str(video_path))
-                if rotation == 0:
-                    rotation = 90  # Default: portrait without tag = needs 90° rotation
-                print(f"  Portrait detected (rotation={rotation}°). Auto-rotating...")
-                tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-                tmp.close()
-                process_path = rotate_video(str(video_path), tmp.name, rotation)
-                temp_files.append(tmp.name)
-                entry["rotated"] = True
-                # Update meta for rotated video
-                meta = get_video_meta(process_path)
-                entry["video_meta_rotated"] = meta
-
-            # Run pipeline
+            # Run full pipeline
             t0 = time.perf_counter()
-            results = pipeline.process_video(process_path)
+            results = pipeline.process_video(str(video_path))
             elapsed = time.perf_counter() - t0
 
             entry["processing_time_s"] = round(elapsed, 2)
-            entry["frames_sampled"] = len(
-                extract_frames(process_path, fps=config.sampling_fps, max_frames=config.max_frames)[0]
-            )
+
+            # Count sampled frames from quality check details if available
+            quality_details = results.get("quality_avg_brightness")
+            if quality_details and quality_details.details:
+                entry["frames_sampled"] = quality_details.details.get("total_frames", "N/A")
+            else:
+                entry["frames_sampled"] = "N/A (metadata failed)"
 
             # Serialize results
             entry["results"] = {}
@@ -356,6 +380,7 @@ Examples:
 
         except Exception as e:
             entry["error"] = str(e)
+            entry["processing_time_s"] = 0.0
             import traceback
             traceback.print_exc()
 
@@ -365,13 +390,6 @@ Examples:
         video_json = output_dir / f"{video_path.stem}.json"
         with open(video_json, "w") as f:
             json.dump(entry, f, indent=2, default=str)
-
-    # Cleanup temp files
-    for tmp in temp_files:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
 
     # Write batch report
     report_path = write_report(all_results, output_dir, config)
