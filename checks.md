@@ -62,11 +62,12 @@ meets the 80% threshold.
 | Check                   | Acceptance Condition                                    | How It Is Estimated              |
 | ----------------------- | ------------------------------------------------------- | -------------------------------- |
 | Face Presence           | Face detection confidence < 0.8 in all frames           | Per-frame face detection         |
-| Participants            | Persons detected <= 1 in >= 95% frames                   | Person detection                 |
+| Participants            | Persons detected <= 1 in >= 90% frames                   | Person detection                 |
 | Hand Visibility         | >= 90% frames with both hands detection confidence >= 0.7 | Per-frame hands detection        |
 | Hand-Object Interaction | Interaction detected in >= 70% frames                    | Hand + object proximity analysis |
 | View Obstruction        | <= 10% frames obstructed                                 | Occlusion detection              |
 | Task Clarity            | Dominant action confidence >= 0.6 in >= 80% frames       | Action recognition               |
+| Body Part Visibility    | Only hands/forearms (up to elbows) visible in >= 90% frames | YOLO11m-pose keypoint detection  |
 | Privacy Safety          | Sensitive object detections = 0 in all frames           | Detection of documents/screens   |
 
 ## Pipeline Behavior

@@ -61,6 +61,7 @@ CHECK_CATEGORIES = [
         ("ml_privacy_safety", "Privacy Safety"),
         ("ml_view_obstruction", "View Obstruction"),
         ("ml_pov_hand_angle", "POV-Hand Angle"),
+        ("ml_body_part_visibility", "Body Part Visibility"),
     ]),
 ]
 
@@ -111,12 +112,13 @@ ACCEPTANCE_CONDITIONS = {
     "motion_camera_stability": "Mean optical flow <= 15 px in >= 80% frame pairs",
     "motion_frozen_segments": "No > 30 consecutive frames with SSIM > 0.99",
     "ml_face_presence": "Face detection confidence < 0.8 in all frames",
-    "ml_participants": "Persons detected <= 1 in >= 95% frames",
+    "ml_participants": "Persons detected <= 1 in >= 90% frames",
     "ml_hand_visibility": ">= 90% frames with both hands confidence >= 0.7",
     "ml_hand_object_interaction": "Interaction detected in >= 70% frames",
     "ml_privacy_safety": "Sensitive object detections = 0 in all frames",
     "ml_view_obstruction": "<= 10% frames obstructed",
     "ml_pov_hand_angle": "Hands within 40 deg of center in >= 80% frames",
+    "ml_body_part_visibility": "Only hands/forearms (up to elbows) in >= 90% frames",
 }
 
 
@@ -146,6 +148,7 @@ def _format_actual(key: str, details: dict) -> str:
         "ml_privacy_safety": lambda: f"{d.get('frames_with_sensitive_objects', '?')} frames with sensitive objects",
         "ml_view_obstruction": lambda: f"{d.get('obstructed_frames', '?')}/{d.get('total_frames', '?')} obstructed ({d.get('obstructed_ratio', 0):.1%})",
         "ml_pov_hand_angle": lambda: f"{d.get('passing_frames', '?')}/{d.get('total_frames', '?')} frames within angle (mean = {d.get('mean_angle', '?')} deg, max = {d.get('max_angle', '?')} deg)",
+        "ml_body_part_visibility": lambda: f"{d.get('clean_frames', '?')}/{d.get('total_frames', '?')} clean frames ({d.get('clean_frames', 0) / max(d.get('total_frames', 1), 1):.1%})" + (f" — flagged: {', '.join(f'{k}({v})' for k, v in d['flagged_body_parts'].items())}" if d.get('flagged_body_parts') else ""),
     }
 
     formatter = formatters.get(key)

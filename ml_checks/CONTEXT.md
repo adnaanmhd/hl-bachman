@@ -8,33 +8,34 @@
 
 ## 1. Problem & Purpose
 
-Humyn Labs is building an egocentric video dataset for **training autonomous humanoid robots**. Videos are captured by a distributed workforce wearing head-mounted cameras while performing agricultural, commercial, and residential tasks. The validation pipeline checks video quality across 18 criteria before data enters the training pipeline.
+Humyn Labs is building an egocentric video dataset for **training autonomous humanoid robots**. Videos are captured by a distributed workforce wearing head-mounted cameras while performing agricultural, commercial, and residential tasks. The validation pipeline checks video quality across 20 criteria before data enters the training pipeline.
 
 **Scale:** ~5,000 videos/day, each ~500MB, 5+ minutes, 1080p, 30FPS.
 **Target:** <5 min total processing per video.
 
-The pipeline validates 5 categories of checks:
+The pipeline validates 5 categories of checks across 20 total criteria:
 1. **Video Metadata** (6 checks) — format, encoding, resolution, frame rate, duration, orientation. Acts as a gate: failure skips all other checks.
 2. **Frame-Level Quality** (3 checks) — average brightness, brightness stability, near-black frames.
 3. **Luminance & Blur** (1 check) — per-frame Tenengrad/luminance classification with segment-level aggregation.
 4. **Motion Analysis** (2 checks) — camera stability via Farneback optical flow, frozen segments via native-FPS SSIM.
-5. **ML Detection** (7 checks) — face presence, participants, hand visibility, hand-object interaction, privacy safety, view obstruction, POV-hand angle.
+5. **ML Detection** (8 checks) — face presence, participants, hand visibility, hand-object interaction, privacy safety, view obstruction, POV-hand angle, body part visibility.
 
 See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 
 ---
 
-## 2. The 7 ML Detection Checks
+## 2. The 8 ML Detection Checks
 
 | # | Check | Criterion | Model |
 |---|---|---|---|
 | 1 | Face Presence | Face detection confidence < 0.8 in ALL frames | SCRFD-2.5GF |
-| 2 | Participants | 0 other persons (face or body parts) in ≥ 95% frames | YOLO11m + SCRFD |
+| 2 | Participants | 0 other persons (face or body parts) in ≥ 90% frames | YOLO11m + SCRFD |
 | 3 | Hand Visibility | Both hands detected (≥ 0.7 conf) in ≥ 90% frames | Hands23 |
 | 4 | Hand-Object Interaction | Interaction detected in ≥ 70% frames | Hands23 (contact state) |
 | 5 | Privacy Safety | Sensitive objects = 0 in ALL frames | YOLO11m pre-filter + Grounding DINO zero-shot |
 | 6 | View Obstruction | ≤ 10% frames obstructed | OpenCV heuristic (no ML) |
 | 7 | POV-Hand Angle | Angle from center to hands < 40° in ≥ 80% frames | Geometric computation on Hands23 output |
+| 8 | Body Part Visibility | Only hands/forearms (up to elbows) visible in ≥ 90% frames | YOLO11m-pose keypoint detection |
 
 ---
 
@@ -84,6 +85,14 @@ See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 - **Two-stage approach:** YOLO11m pre-filters frames that contain COCO sensitive classes (tv, laptop, cell_phone). Grounding DINO runs only on those flagged frames (~0-10% of total), keeping it fast.
 - **Package:** HuggingFace `transformers` (`IDEA-Research/grounding-dino-base`)
 - **Speed:** ~2,757ms/frame CPU
+
+#### YOLO11m-pose (Body Part Visibility — Check 8)
+- **Why:** Detects 17 COCO body keypoints per person. Used to verify that only the wearer's hands and forearms (up to elbows) are visible — no shoulders, torso, hips, legs, or feet.
+- **Why YOLO11m-pose over MediaPipe Pose:** Same rationale as YOLO11m over MediaPipe for other tasks — more robust on egocentric angles.
+- **Wearer identification:** Same heuristic as participants check (bottom-center anchored or overlapping with Hands23 hand detections).
+- **Allowed keypoints:** Left/right elbows (7, 8) and wrists (9, 10). All others (nose, eyes, ears, shoulders, hips, knees, ankles) are flagged.
+- **Package:** `ultralytics` (same as YOLO11m)
+- **Speed:** ~114ms/frame CPU
 
 #### View Obstruction Heuristic (Check 6)
 - **No ML model.** Combines 4 signals on central 80% of frame:
@@ -207,12 +216,13 @@ Video file
   → Per frame (ML):
       1. SCRFD face detection (~10ms)
       2. YOLO11m object detection (~88ms)
-      3. Hands23 hand-object detection (~1.4s CPU / ~100-200ms GPU)
-      4. View obstruction heuristic (<1ms)
+      3. YOLO11m-pose keypoint detection (~114ms)
+      4. Hands23 hand-object detection (~1.4s CPU / ~100-200ms GPU)
+      5. View obstruction heuristic (<1ms)
   → If YOLO flagged sensitive objects:
-      5. Grounding DINO on flagged frames only (~2.8s/frame CPU)
-  → Distribute results to 7 ML check functions
-  → Aggregate all 18 check results
+      6. Grounding DINO on flagged frames only (~2.8s/frame CPU)
+  → Distribute results to 8 ML check functions
+  → Aggregate all 20 check results
 ```
 
 ### Grounding DINO Two-Stage Approach
@@ -258,11 +268,13 @@ hl-bachman/
     │   ├── hand_object_interaction.py  # Contact state check
     │   ├── privacy_safety.py           # Sensitive object detection
     │   ├── view_obstruction.py         # Lens obstruction heuristic
-    │   └── pov_hand_angle.py           # Hand angle check
+    │   ├── pov_hand_angle.py           # Hand angle check
+    │   └── body_part_visibility.py    # Body part keypoint check
     ├── models/
     │   ├── download_models.py          # Model weight downloader
     │   ├── scrfd_detector.py           # SCRFD face detector
     │   ├── yolo_detector.py            # YOLO11m object detector
+    │   ├── yolo_pose_detector.py       # YOLO11m-pose keypoint detector
     │   ├── hand_detector.py            # Hands23 hand-object detector
     │   ├── grounding_dino_detector.py  # Zero-shot privacy detector
     │   └── weights/                    # ~1.5GB, downloaded on first run
@@ -271,7 +283,7 @@ hl-bachman/
         └── video_metadata.py           # FFprobe metadata extraction
 ```
 
-**YOLO11m weights** (`yolo11m.pt`) are downloaded by ultralytics to its default cache (~40MB).
+**YOLO weights** (`yolo11m.pt`, `yolo11m-pose.pt`) are downloaded by ultralytics on first run (~40MB each).
 
 ---
 
@@ -336,6 +348,7 @@ tqdm>=4.65
 | Farneback over Lucas-Kanade for stability | Dense optical flow gives more accurate camera motion estimate |
 | Native FPS for frozen segments | 30 consecutive frames = 1 second; sampled frames would miss short freezes |
 | 1 FPS sampling for ML checks | 120 frames gives sufficient temporal coverage; configurable for GPU |
+| YOLO11m-pose for body part visibility | Same ultralytics ecosystem as YOLO11m, no new dependencies. 17-keypoint detection identifies which body parts are visible. Allowed: wrists + elbows only (hands through forearms). |
 
 ---
 

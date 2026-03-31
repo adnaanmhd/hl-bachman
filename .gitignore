@@ -13,6 +13,7 @@ build/
 # Model weights (downloaded at setup time)
 ml_checks/models/weights/
 yolo11m.pt
+yolo11m-pose.pt
 yolo11m.onnx
 
 # Sample data and test outputs

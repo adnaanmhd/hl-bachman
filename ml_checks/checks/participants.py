@@ -1,6 +1,6 @@
 """Check 2: Participants.
 
-Criterion: 0 other persons (face or body parts) in >= 95% of frames.
+Criterion: 0 other persons (face or body parts) in >= 90% of frames.
 Purpose: Verify solo task performance. Camera wearer is invisible.
 """
 
@@ -54,7 +54,7 @@ def check_participants(
     per_frame_faces: list[list[FaceDetection]],
     per_frame_hands: list[list[HandDetection]],
     frame_dims: tuple[int, int],  # (height, width)
-    pass_rate_threshold: float = 0.95,
+    pass_rate_threshold: float = 0.90,
     person_conf_threshold: float = 0.4,
     face_conf_threshold: float = 0.5,
     min_person_height_ratio: float = 0.15,

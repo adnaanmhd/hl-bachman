@@ -1,7 +1,7 @@
 """Download all required model weights and set up dependencies for ML checks.
 
 Usage:
-    python ml_checks/models/download_models.py          # Download SCRFD, YOLO11m, Grounding DINO, Hands23
+    python ml_checks/models/download_models.py          # Download SCRFD, YOLO11m, YOLO11m-pose, Grounding DINO, Hands23
     python ml_checks/models/download_models.py --100doh  # Also download + compile 100DOH (legacy)
     python ml_checks/models/download_models.py --all     # Everything including legacy 100DOH
 """
@@ -44,10 +44,22 @@ def download_yolo11m():
     return model
 
 
+def download_yolo11m_pose():
+    """Download YOLO11m-pose model."""
+    print("\n" + "=" * 60)
+    print("3. YOLO11m-pose Keypoint Detector")
+    print("=" * 60)
+    from ultralytics import YOLO
+
+    model = YOLO("yolo11m-pose.pt")
+    print(f"YOLO11m-pose loaded: {model.model_name}")
+    return model
+
+
 def download_grounding_dino():
     """Download Grounding DINO model via HuggingFace transformers."""
     print("\n" + "=" * 60)
-    print("3. Grounding DINO (via HuggingFace)")
+    print("4. Grounding DINO (via HuggingFace)")
     print("=" * 60)
     from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
@@ -295,6 +307,7 @@ if __name__ == "__main__":
 
     download_scrfd()
     download_yolo11m()
+    download_yolo11m_pose()
     download_grounding_dino()
     download_hands23()
 

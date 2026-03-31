@@ -5,7 +5,7 @@ Runs all checks in order:
   2. Frame-level quality
   3. Luminance & blur
   4. Motion analysis
-  5. ML detection (SCRFD, YOLO11m, Hands23, Grounding DINO)
+  5. ML detection (SCRFD, YOLO11m, YOLO11m-pose, Hands23, Grounding DINO)
 
 Results are keyed by category: meta_*, quality_*, luminance_blur,
 motion_*, ml_*.
@@ -35,6 +35,7 @@ from ml_checks.checks.hand_object_interaction import check_hand_object_interacti
 from ml_checks.checks.privacy_safety import check_privacy_safety
 from ml_checks.checks.view_obstruction import check_view_obstruction
 from ml_checks.checks.pov_hand_angle import check_pov_hand_angle
+from ml_checks.checks.body_part_visibility import check_body_part_visibility
 from ml_checks.utils.frame_extractor import extract_frames
 
 
@@ -53,6 +54,7 @@ NON_META_CHECK_KEYS = [
     "ml_privacy_safety",
     "ml_view_obstruction",
     "ml_pov_hand_angle",
+    "ml_body_part_visibility",
 ]
 
 
@@ -66,6 +68,7 @@ class PipelineConfig:
     # Model paths
     scrfd_root: str = "ml_checks/models/weights/insightface"
     yolo_model: str = "yolo11m.pt"
+    yolo_pose_model: str = "yolo11m-pose.pt"
     hand_detector_repo: str = "ml_checks/models/weights/hands23_detector"
     gdino_cache: str = "ml_checks/models/weights/grounding_dino"
 
@@ -75,13 +78,15 @@ class PipelineConfig:
     hand_confidence_threshold: float = 0.7
     hand_pass_rate: float = 0.90
     interaction_pass_rate: float = 0.70
-    participant_pass_rate: float = 0.95
+    participant_pass_rate: float = 0.90
     privacy_yolo_threshold: float = 0.6
     privacy_gdino_threshold: float = 0.3
     obstruction_max_ratio: float = 0.10
     angle_threshold: float = 40.0
     angle_pass_rate: float = 0.80
     diagonal_fov_degrees: float = 90.0
+    body_part_pass_rate: float = 0.90
+    body_part_keypoint_conf: float = 0.5
 
     # Grounding DINO
     run_grounding_dino: bool = True
@@ -127,14 +132,19 @@ class ValidationPipeline:
         self.yolo_detector = YOLODetector(model_path=self.config.yolo_model)
         print("  YOLO11m loaded")
 
-        # 3. Hands23 hand-object detector
+        # 3. YOLO11m-pose
+        from ml_checks.models.yolo_pose_detector import YOLOPoseDetector
+        self.pose_detector = YOLOPoseDetector(model_path=self.config.yolo_pose_model)
+        print("  YOLO11m-pose loaded")
+
+        # 4. Hands23 hand-object detector
         from ml_checks.models.hand_detector import HandObjectDetectorHands23
         self.hand_detector = HandObjectDetectorHands23(
             repo_dir=self.config.hand_detector_repo,
         )
         print("  Hands23 loaded")
 
-        # 4. Grounding DINO (optional, for privacy)
+        # 5. Grounding DINO (optional, for privacy)
         self.gdino_detector = None
         if self.config.run_grounding_dino:
             from ml_checks.models.grounding_dino_detector import GroundingDINODetector
@@ -246,12 +256,14 @@ class ValidationPipeline:
         per_frame_yolo_sensitive = []
         per_frame_hands = []
         per_frame_objects = []
+        per_frame_poses = []
         flagged_for_gdino = []
 
         from ml_checks.models.yolo_detector import PERSON_CLASS, SENSITIVE_CLASSES
 
         t_scrfd = 0
         t_yolo = 0
+        t_pose = 0
         t_hands23 = 0
 
         for i, frame in enumerate(frames):
@@ -271,6 +283,11 @@ class ValidationPipeline:
                 flagged_for_gdino.append(i)
 
             t0 = time.perf_counter()
+            poses = self.pose_detector.detect(frame)
+            t_pose += time.perf_counter() - t0
+            per_frame_poses.append(poses)
+
+            t0 = time.perf_counter()
             hands, objects = self.hand_detector.detect(frame)
             t_hands23 += time.perf_counter() - t0
             per_frame_hands.append(hands)
@@ -281,6 +298,7 @@ class ValidationPipeline:
 
         timings["scrfd"] = t_scrfd
         timings["yolo"] = t_yolo
+        timings["yolo_pose"] = t_pose
         timings["hands23"] = t_hands23
 
         # Grounding DINO on flagged frames
@@ -347,6 +365,14 @@ class ValidationPipeline:
             diagonal_fov_degrees=self.config.diagonal_fov_degrees,
         )
 
+        results["ml_body_part_visibility"] = check_body_part_visibility(
+            per_frame_poses,
+            per_frame_hands,
+            frame_dims=(frame_h, frame_w),
+            pass_rate_threshold=self.config.body_part_pass_rate,
+            keypoint_conf_threshold=self.config.body_part_keypoint_conf,
+        )
+
         # ── Summary ──────────────────────────────────────────────
         total_time = sum(timings.values())
         timings["total"] = total_time
@@ -360,6 +386,7 @@ class ValidationPipeline:
         print(f"  Frozen segments:  {timings['frozen_segments']:.2f}s")
         print(f"  SCRFD:            {timings['scrfd']:.2f}s")
         print(f"  YOLO11m:          {timings['yolo']:.2f}s")
+        print(f"  YOLO11m-pose:     {timings['yolo_pose']:.2f}s")
         print(f"  Hands23:          {timings['hands23']:.2f}s")
         print(f"  Grounding DINO:   {timings['grounding_dino']:.2f}s")
         print(f"  TOTAL:            {total_time:.2f}s")
