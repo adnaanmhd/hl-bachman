@@ -23,6 +23,7 @@ Setup only (no pipeline run):
 - **FFmpeg** (ffprobe used for metadata extraction)
 - **~2GB disk** (model weights + virtual environment)
 - **macOS** (Apple Silicon) or **Linux** (Ubuntu/Debian)
+- **Windows:** Not natively supported (detectron2 lacks Windows support). Use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) -- the pipeline runs fully inside a WSL2 Ubuntu environment.
 - GPU optional -- auto-detected. Force CPU with `FORCE_CPU=1 ./validate.sh ...`
 
 ## What It Checks
