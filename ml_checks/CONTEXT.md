@@ -30,7 +30,7 @@ See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 |---|---|---|---|
 | 1 | Face Presence | Face detection confidence < 0.8 in ALL frames | SCRFD-2.5GF |
 | 2 | Participants | 0 other persons (face or body parts) in ≥ 90% frames | YOLO11m + SCRFD |
-| 3 | Hand Visibility | Both hands detected (≥ 0.7 conf) in ≥ 90% frames | Hands23 |
+| 3 | Hand Visibility | Both hands fully in frame (bbox > 2 px from every edge, ≥ 0.7 conf) in ≥ 90% frames | Hands23 |
 | 4 | Hand-Object Interaction | Interaction detected in ≥ 70% frames | Hands23 (contact state) |
 | 5 | Privacy Safety | Sensitive objects = 0 in ALL frames | YOLO11m pre-filter + Grounding DINO zero-shot |
 | 6 | View Obstruction | ≤ 10% frames obstructed | OpenCV heuristic (no ML) |
@@ -67,7 +67,7 @@ See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 - **Why Hands23 over 100DOH:** NeurIPS 2023 successor to 100DOH. Trained on 250K images including EPIC-KITCHENS and VISOR egocentric datasets. No custom C++ compilation needed (pure Detectron2). ~3.5x faster than 100DOH on CPU.
 - **Why over MediaPipe:** MediaPipe Hand Landmarker has documented AP50 of 29-97% on egocentric data (wildly inconsistent). Hands23 was **trained specifically on egocentric hand images**.
 - **Why not HaMeR:** ViT-H backbone (~630M params, ~200-500ms/frame GPU) is overkill for "are hands visible?" detection. HaMeR reconstructs full 3D mesh — we only need bounding boxes + confidence + contact state.
-- **Key advantage:** Returns hand contact state (N/S/O/P/F) directly — eliminates need for crude bounding-box overlap heuristic for hand-object interaction detection.
+- **Key advantage:** Returns hand contact state (N/S/O/P/F) directly — eliminates need for crude bounding-box overlap heuristic for hand-object interaction detection. Hand bounding boxes are also used for in-frame visibility checks (bbox edge clearance ≥ 2 px).
 - **Contact states:** N=no contact, S=self, O=other person, P=portable object, F=stationary object. States P and F = interaction.
 - **Architecture:** Faster R-CNN with X-101-FPN backbone, custom heads for contact state, hand side, and grasp type classification.
 - **Package:** Custom repo (`github.com/EvaCheng-cty/hands23_detector`) + `detectron2`

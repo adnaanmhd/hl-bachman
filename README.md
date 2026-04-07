@@ -190,7 +190,7 @@ Per-frame classification using Tenengrad sharpness + luminance zones. Video pass
 |---|---|---|
 | Face Presence | SCRFD-2.5GF | Face confidence < 0.8 in all frames |
 | Participants | YOLO11s + SCRFD | Persons <= 1 in >= 90% frames |
-| Hand Visibility | Hands23 | Both hands in >= 90% frames |
+| Hand Visibility | Hands23 | Both hands fully in frame (bbox > 2 px from every edge) in >= 90% frames |
 | Hand-Object Interaction | Hands23 | Interaction in >= 70% frames |
 | Privacy Safety | YOLO11s + Grounding DINO | 0 sensitive objects in all frames |
 | View Obstruction | OpenCV heuristics | <= 10% frames obstructed |

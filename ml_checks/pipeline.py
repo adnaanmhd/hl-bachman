@@ -92,6 +92,7 @@ class PipelineConfig:
     diagonal_fov_degrees: float = 90.0
     body_part_pass_rate: float = 0.90
     body_part_keypoint_conf: float = 0.5
+    hand_frame_margin: int = 2
 
     # Grounding DINO
     run_grounding_dino: bool = True
@@ -391,7 +392,8 @@ class ValidationPipeline:
 
                 # Update early stop monitor
                 monitor.update("hand_visibility",
-                    eval_hand_visibility(hands, self.config.hand_confidence_threshold))
+                    eval_hand_visibility(hands, self.config.hand_confidence_threshold,
+                                         frame_w, frame_h, self.config.hand_frame_margin))
                 monitor.update("face_presence",
                     eval_face_presence(faces, self.config.face_confidence_threshold))
                 monitor.update("participants",
@@ -505,8 +507,10 @@ class ValidationPipeline:
         else:
             results["ml_hand_visibility"] = check_hand_visibility(
                 per_frame_hands,
+                frame_dims=(frame_h, frame_w),
                 confidence_threshold=self.config.hand_confidence_threshold,
                 pass_rate_threshold=self.config.hand_pass_rate,
+                frame_margin=self.config.hand_frame_margin,
             )
 
         # -- hand_object_interaction

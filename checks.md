@@ -13,10 +13,10 @@
 
 ## Motion Analysis
 
-| Check            | Acceptance Condition                        | How It Is Estimated                            |
-| ---------------- | ------------------------------------------- | ---------------------------------------------- |
-| Camera Stability | Two-stage LK shakiness score <= 0.30        | Sparse Lucas-Kanade optical flow (two-stage)   |
-| Frozen Segments  | No > 30 consecutive frames with SSIM > 0.99 | Native FPS frame similarity                    |
+| Check            | Acceptance Condition                        | How It Is Estimated                          |
+| ---------------- | ------------------------------------------- | -------------------------------------------- |
+| Camera Stability | Two-stage LK shakiness score <= 0.30        | Sparse Lucas-Kanade optical flow (two-stage) |
+| Frozen Segments  | No > 30 consecutive frames with SSIM > 0.99 | Native FPS frame similarity                  |
 
 ### Camera Stability — Two-Stage Pipeline
 
@@ -27,12 +27,12 @@ RANSAC from tracked corner features, yielding per-frame translation (px) and
 rotation (degrees). These are combined into a per-second shakiness score
 using weighted components:
 
-| Component              | Weight | Normalisation                       |
-| ---------------------- | ------ | ----------------------------------- |
-| Mean translation       | 0.35   | avg_t / (trans_threshold * 3)       |
-| Translation variance   | 0.25   | std_t / (variance_threshold * 2)    |
-| Mean rotation          | 0.20   | avg_r / (rot_threshold * 3)         |
-| Sudden jumps (> 30 px) | 0.20   | (jump_count / n) * 10              |
+| Component              | Weight | Normalisation                     |
+| ---------------------- | ------ | --------------------------------- |
+| Mean translation       | 0.35   | avg_t / (trans_threshold \* 3)    |
+| Translation variance   | 0.25   | std_t / (variance_threshold \* 2) |
+| Mean rotation          | 0.20   | avg_r / (rot_threshold \* 3)      |
+| Sudden jumps (> 30 px) | 0.20   | (jump_count / n) \* 10            |
 
 All component scores are clamped to [0, 1]; the weighted sum produces a
 per-second score in [0, 1].
@@ -54,6 +54,7 @@ equivalents before scoring.
 
 Per-frame classification using the decision table below, followed by segment-level
 aggregation. Two acceptance conditions must both pass:
+
 1. (accept + review) frames >= 80% of total frames
 2. Brightness stability: std dev of per-frame mean luminance <= 60
 
@@ -85,19 +86,57 @@ meets the 80% threshold.
 
 ## ML Detection
 
-| Check                   | Acceptance Condition                                        | How It Is Estimated              |
-| ----------------------- | ----------------------------------------------------------- | -------------------------------- |
-| Face Presence           | Face detection confidence < 0.8 in all frames               | Per-frame face detection         |
-| Participants            | Persons detected <= 1 in >= 90% frames                      | Person detection                 |
-| Hand Visibility         | >= 90% frames with both hands detection confidence >= 0.7   | Per-frame hands detection        |
-| Hand-Object Interaction | Interaction detected in >= 70% frames                       | Hand + object proximity analysis |
-| View Obstruction        | <= 10% frames obstructed                                    | Occlusion detection              |
-| Body Part Visibility    | Only hands/forearms (up to elbows) visible in >= 90% frames | YOLO11m-pose keypoint detection  |
-| Privacy Safety          | Sensitive object detections = 0 in all frames               | Detection of documents/screens   |
+| Check                   | Acceptance Condition                                                                          | How It Is Estimated                             |
+| ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Face Presence           | Face detection confidence < 0.8 in all frames                                                 | Per-frame face detection                        |
+| Participants            | Persons detected <= 1 in >= 90% frames                                                        | Person detection                                |
+| Hand Visibility         | >= 90% frames with both hands fully in frame (bbox > 2 px from every edge, confidence >= 0.7) | Per-frame hands detection + bbox edge clearance |
+| Hand-Object Interaction | Interaction detected in >= 70% frames                                                         | Hand + object proximity analysis                |
+| View Obstruction        | <= 10% frames obstructed                                                                      | Occlusion detection                             |
+| Body Part Visibility    | Only hands/forearms (up to elbows) visible in >= 90% frames                                   | YOLO11m-pose keypoint detection                 |
+| POV-Hand Angle          | Hand angle from frame center < 40° in >= 80% frames                                           | Hand bbox center vs frame center                |
+| Privacy Safety          | Sensitive object detections = 0 in all frames                                                 | Two-stage YOLO + Grounding DINO                 |
+
+### POV-Hand Angle
+
+Measures whether detected hands fall within a plausible first-person (egocentric)
+field of view. For each hand bounding box, the center is computed and its pixel
+distance from the frame center is normalized by the frame's half-diagonal. This
+normalized distance is mapped to an angle using an assumed diagonal FOV of 90°:
+
+    angle = (pixel_dist / half_diagonal) * (diagonal_fov / 2)
+
+A frame passes if ALL detected hands have angle < 40°. Frames with no hands
+detected count as failures. The video passes if >= 80% of frames pass.
+
+### Privacy Safety — Two-Stage Detection
+
+**Stage 1 (YOLO11m):** Every sampled frame is checked for COCO sensitive classes
+(tv=62, laptop=63, cell_phone=67, book=73) at confidence >= 0.6. Frames with
+detections are flagged for Stage 2.
+
+**Stage 2 (Grounding DINO):** Only flagged frames are re-analysed using zero-shot
+detection with the text prompt:
+
+    "laptop screen . computer monitor . smartphone screen .
+     paper document . credit card . ID card . identification card . bank card"
+
+Grounding DINO thresholds: box_threshold=0.3, text_threshold=0.25. A frame is
+marked sensitive if either stage produces a high-confidence detection. The video
+passes only if zero frames are marked sensitive (zero tolerance).
 
 ## Pipeline Behavior
 
 - **Metadata gate:** If any video metadata check fails, all other checks are skipped.
 - **Independent categories:** Luminance & blur, motion analysis, and ML detection run
-  independently -- a failure in one does not skip others.
+  independently -- a failure in one does not skip others (unless `fail_fast` is enabled,
+  in which case a luminance failure skips motion + ML, and a motion failure skips ML).
+- **Parallel execution:** When `fail_fast` is disabled (default), motion analysis runs in
+  a background thread concurrently with ML detection.
+- **Early stopping:** During ML inference, an `EarlyStopMonitor` tracks per-check outcomes
+  frame by frame. Zero-tolerance checks (face presence, privacy safety) fail immediately on
+  the first failing frame. Threshold-based checks (hand visibility, participants, interaction,
+  POV-hand angle, body part visibility) are marked pass once they have accumulated enough
+  passing frames, or fail once the required pass rate becomes mathematically unreachable.
+  When all check outcomes are determined, the inference loop terminates early.
 - **Statuses:** pass, fail, review (for borderline results), skipped (metadata gate).

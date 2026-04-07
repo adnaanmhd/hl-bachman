@@ -109,12 +109,25 @@ class EarlyStopMonitor:
 _INTERACTION_STATES = {ContactState.PORTABLE_OBJ, ContactState.STATIONARY_OBJ}
 
 
+def _hand_in_frame(bbox, frame_w: int, frame_h: int, margin: int) -> bool:
+    x1, y1, x2, y2 = bbox
+    return (x1 > margin and y1 > margin
+            and x2 < frame_w - margin and y2 < frame_h - margin)
+
+
 def eval_hand_visibility(
     hands: list[HandDetection],
     confidence_threshold: float,
+    frame_w: int,
+    frame_h: int,
+    frame_margin: int = 2,
 ) -> bool:
-    """True if >= 2 confident hand detections in this frame."""
-    return sum(1 for h in hands if h.confidence >= confidence_threshold) >= 2
+    """True if >= 2 confident hand detections fully within the frame."""
+    return sum(
+        1 for h in hands
+        if h.confidence >= confidence_threshold
+        and _hand_in_frame(h.bbox, frame_w, frame_h, frame_margin)
+    ) >= 2
 
 
 def eval_face_presence(
