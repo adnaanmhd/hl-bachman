@@ -2,6 +2,136 @@
 
 Validates egocentric (first-person POV) video quality across 15 checks for datasets used to train autonomous humanoid robots. Runs 4 check categories: video metadata, luminance & blur, motion analysis, and ML-based detection.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph ENTRY["validate.sh — Single Command Entry Point"]
+        A1[Check Python 3.11+, FFmpeg, Git] --> A2[Create .venv + Install PyTorch]
+        A2 --> A3[Install detectron2 + ONNX Runtime]
+        A3 --> A4[pip install -e . + Download Models ~1.2GB]
+        A4 --> A5["hl-validate /path/to/videos/"]
+    end
+
+    A5 --> BATCH
+
+    subgraph BATCH["Batch Runner — run_batch.py"]
+        direction TB
+        B1[Collect .mp4 files] --> B2{--workers}
+        B2 -->|"1 (sequential)"| B3[Single pipeline instance]
+        B2 -->|"N (parallel)"| B4["multiprocessing.Pool(N)<br/>Each worker loads own models"]
+    end
+
+    B3 --> PV
+    B4 --> PV
+
+    subgraph PV["Per-Video Pipeline — pipeline.py"]
+        direction TB
+
+        M["<b>Step 1: Metadata Gate</b><br/>FFprobe: format, codec, resolution,<br/>frame rate, duration, orientation"]
+        M -->|Any fail| SKIP_ALL["Skip all other checks<br/>(status: skipped)"]
+        M -->|All pass| FE
+
+        FE["<b>Step 2: Frame Extraction</b><br/>OpenCV @ 1 FPS → ~180 frames"]
+        FE --> LB
+
+        LB["<b>Step 3: Luminance & Blur</b><br/>Tenengrad sharpness + luminance zones"]
+        LB -->|"fail-fast + fail"| SKIP_REST["Skip motion + ML<br/>(status: skipped)"]
+        LB -->|pass or no fail-fast| FF_CHECK
+
+        FF_CHECK{fail-fast?}
+
+        FF_CHECK -->|Yes| SEQ_MOTION
+        FF_CHECK -->|No| PAR
+
+        subgraph SEQ_MOTION["Sequential (fail-fast on)"]
+            SM1["<b>Motion Analysis</b><br/>Camera Stability (LK optical flow, capped 30 FPS)<br/>Frozen Segments (subsampled 10 FPS)"]
+            SM1 -->|fail| SKIP_ML["Skip ML inference<br/>(status: skipped)"]
+            SM1 -->|pass| ML_SEQ["ML Inference"]
+        end
+
+        subgraph PAR["Parallel (fail-fast off)"]
+            direction LR
+            P_MOTION["<b>Background Thread</b><br/>Camera Stability<br/>Frozen Segments"]
+            P_ML["<b>Main Thread</b><br/>ML Inference"]
+        end
+    end
+
+    ML_SEQ --> ML_LOOP
+    P_ML --> ML_LOOP
+
+    subgraph ML_LOOP["ML Inference Loop — Batched + Early Stopping"]
+        direction TB
+        BATCH_START["For each batch of 16 frames:"]
+        BATCH_START --> YOLO_BATCH
+
+        subgraph MODELS["Model Inference"]
+            direction TB
+            YOLO_BATCH["<b>YOLO11s</b> — batch detect<br/>Persons + sensitive objects"]
+            YOLO_BATCH --> POSE_BATCH["<b>YOLO11m-pose</b> — batch detect<br/>17 body keypoints"]
+            POSE_BATCH --> PER_FRAME["Per-frame:"]
+            PER_FRAME --> SCRFD["<b>SCRFD-2.5GF</b><br/>Face detection"]
+            SCRFD --> HANDS23["<b>Hands23</b><br/>Hand detection + contact state"]
+        end
+
+        HANDS23 --> ES_UPDATE
+
+        subgraph EARLY_STOP["EarlyStopMonitor"]
+            ES_UPDATE["Update 7 check trackers"]
+            ES_UPDATE --> ES_CHECK{"All checks<br/>determined?"}
+            ES_CHECK -->|"Yes → stop early"| ES_DONE["Skip remaining frames"]
+            ES_CHECK -->|No| NEXT_BATCH["Continue to next batch"]
+        end
+    end
+
+    ES_DONE --> GDINO_CHECK
+    NEXT_BATCH -.->|loop| BATCH_START
+
+    GDINO_CHECK{"Privacy failed<br/>by YOLO alone?"}
+    GDINO_CHECK -->|Yes, skip| CHECKS
+    GDINO_CHECK -->|"No, flagged frames exist"| GDINO
+
+    GDINO["<b>Grounding DINO</b><br/>Zero-shot detection on flagged frames only"]
+    GDINO --> CHECKS
+
+    subgraph CHECKS["Step 6: Check Aggregation — 8 ML Checks"]
+        direction LR
+        C1["Face Presence"]
+        C2["Participants"]
+        C3["Hand Visibility"]
+        C4["Hand-Object Interaction"]
+        C5["Privacy Safety"]
+        C6["View Obstruction"]
+        C7["POV-Hand Angle"]
+        C8["Body Part Visibility"]
+    end
+
+    CHECKS --> OUTPUT
+
+    subgraph OUTPUT["Output"]
+        direction LR
+        O1["per_video.json"]
+        O2["batch_report.md"]
+        O3["batch_results.json"]
+        O4["index.md"]
+    end
+
+    style ENTRY fill:#1a1a2e,stroke:#e94560,color:#eee
+    style BATCH fill:#16213e,stroke:#0f3460,color:#eee
+    style PV fill:#0f3460,stroke:#533483,color:#eee
+    style ML_LOOP fill:#533483,stroke:#e94560,color:#eee
+    style EARLY_STOP fill:#2d1b69,stroke:#e94560,color:#eee
+    style CHECKS fill:#1a1a2e,stroke:#0f3460,color:#eee
+    style OUTPUT fill:#16213e,stroke:#e94560,color:#eee
+    style SKIP_ALL fill:#8b0000,stroke:#ff0000,color:#eee
+    style SKIP_REST fill:#8b0000,stroke:#ff0000,color:#eee
+    style SKIP_ML fill:#8b0000,stroke:#ff0000,color:#eee
+    style ES_DONE fill:#006400,stroke:#00ff00,color:#eee
+    style PAR fill:#1a3a5c,stroke:#0f3460,color:#eee
+    style SEQ_MOTION fill:#1a3a5c,stroke:#0f3460,color:#eee
+    style MODELS fill:#3d1f6d,stroke:#533483,color:#eee
+```
+
 ## Quick Start
 
 ```bash
