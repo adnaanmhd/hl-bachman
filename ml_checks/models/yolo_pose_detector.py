@@ -72,3 +72,37 @@ class YOLOPoseDetector:
                     )
                 )
         return detections
+
+    def detect_batch(self, frames_bgr: list[np.ndarray]) -> list[list[PoseDetection]]:
+        """Run pose estimation on a batch of BGR frames.
+
+        Args:
+            frames_bgr: List of OpenCV BGR images.
+
+        Returns:
+            List of pose detection lists, one per input frame.
+        """
+        if not frames_bgr:
+            return []
+        results = self.model.predict(
+            frames_bgr,
+            conf=self.conf_threshold,
+            imgsz=self.imgsz,
+            verbose=False,
+        )
+        batch_detections = []
+        for r in results:
+            frame_dets = []
+            if r.boxes is not None and r.keypoints is not None:
+                boxes = r.boxes
+                kpts = r.keypoints
+                for i in range(len(boxes)):
+                    frame_dets.append(
+                        PoseDetection(
+                            bbox=boxes[i].xyxy[0].cpu().numpy(),
+                            confidence=float(boxes[i].conf[0]),
+                            keypoints=kpts[i].data[0].cpu().numpy(),
+                        )
+                    )
+            batch_detections.append(frame_dets)
+        return batch_detections

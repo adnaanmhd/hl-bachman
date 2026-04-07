@@ -16,6 +16,7 @@ import time
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 from ml_checks.checks.check_results import CheckResult
 from ml_checks.utils.video_metadata import get_video_metadata
@@ -31,7 +32,20 @@ from ml_checks.checks.view_obstruction import check_view_obstruction
 from ml_checks.checks.pov_hand_angle import check_pov_hand_angle
 from ml_checks.checks.body_part_visibility import check_body_part_visibility
 from ml_checks.utils.frame_extractor import extract_frames
+from ml_checks.utils.early_stop import (
+    EarlyStopMonitor,
+    CheckSpec,
+    eval_hand_visibility,
+    eval_face_presence,
+    eval_participants,
+    eval_hand_object_interaction,
+    eval_pov_hand_angle,
+    eval_body_part_visibility,
+    eval_privacy_safety,
+)
 
+# Batch size for YOLO inference in the ML loop
+_BATCH_SIZE = 16
 
 # All non-metadata check keys, used for skipped results on metadata failure
 NON_META_CHECK_KEYS = [
@@ -58,7 +72,7 @@ class PipelineConfig:
 
     # Model paths
     scrfd_root: str = "ml_checks/models/weights/insightface"
-    yolo_model: str = "yolo11m.pt"
+    yolo_model: str = "yolo11s.pt"
     yolo_pose_model: str = "yolo11m-pose.pt"
     hand_detector_repo: str = "ml_checks/models/weights/hands23_detector"
     gdino_cache: str = "ml_checks/models/weights/grounding_dino"
@@ -105,13 +119,18 @@ class PipelineConfig:
     stability_max_corners: int = 300
     stability_lk_win_size: tuple[int, int] = (21, 21)
     stability_lk_max_level: int = 3
+    stability_target_fps: float = 30.0
 
     # Frozen segments
     frozen_max_consecutive: int = 30
     frozen_ssim_threshold: float = 0.99
+    frozen_target_fps: float = 10.0
 
     # Luminance & blur
     luminance_blur_min_good_ratio: float = 0.80
+
+    # Fail-fast: skip ML inference when quality checks fail
+    fail_fast: bool = False
 
 
 class ValidationPipeline:
@@ -220,39 +239,82 @@ class ValidationPipeline:
         timings["luminance_blur"] = time.perf_counter() - t0
         print(f"Luminance & blur check ({timings['luminance_blur']:.2f}s)")
 
-        # ── Step 4: Motion analysis ───────────────────────────────
-        t0 = time.perf_counter()
-        results["motion_camera_stability"] = check_camera_stability(
-            video_path,
-            shaky_score_threshold=self.config.shaky_score_threshold,
-            deep_score_threshold=self.config.deep_score_threshold,
-            fast_scale=self.config.fast_scale,
-            frame_skip=self.config.frame_skip,
-            trans_threshold=self.config.stability_trans_threshold,
-            jump_threshold=self.config.stability_jump_threshold,
-            rot_threshold=self.config.stability_rot_threshold,
-            variance_threshold=self.config.stability_variance_threshold,
-            w_trans=self.config.stability_w_trans,
-            w_var=self.config.stability_w_var,
-            w_rot=self.config.stability_w_rot,
-            w_jump=self.config.stability_w_jump,
-            max_corners=self.config.stability_max_corners,
-            lk_win_size=self.config.stability_lk_win_size,
-            lk_max_level=self.config.stability_lk_max_level,
-        )
-        timings["camera_stability"] = time.perf_counter() - t0
+        # ── Fail-fast gate on luminance ─────────────────────────
+        if self.config.fail_fast and results["luminance_blur"].status == "fail":
+            print("  Fail-fast: skipping motion + ML (luminance_blur failed)")
+            for key in [k for k in NON_META_CHECK_KEYS if k != "luminance_blur"]:
+                results[key] = CheckResult(
+                    status="skipped", metric_value=0.0, confidence=1.0,
+                    details={"reason": "fail-fast: luminance_blur failed"},
+                )
+            return results
 
-        t0 = time.perf_counter()
-        results["motion_frozen_segments"] = check_frozen_segments(
-            video_path,
-            max_consecutive=self.config.frozen_max_consecutive,
-            ssim_threshold=self.config.frozen_ssim_threshold,
-        )
-        timings["frozen_segments"] = time.perf_counter() - t0
-        print(f"Motion analysis ({timings['camera_stability']:.2f}s stability, "
-              f"{timings['frozen_segments']:.2f}s frozen)")
+        # ── Step 4+5: Motion analysis + ML inference ─────────────
+        # When fail-fast is on, run motion first so we can skip ML on failure.
+        # When fail-fast is off, run motion in a background thread while ML
+        # runs on the main thread (parallel execution).
 
-        # ── Step 5: ML model inference ────────────────────────────
+        def _run_motion():
+            t_stab = time.perf_counter()
+            stability = check_camera_stability(
+                video_path,
+                shaky_score_threshold=self.config.shaky_score_threshold,
+                deep_score_threshold=self.config.deep_score_threshold,
+                fast_scale=self.config.fast_scale,
+                frame_skip=self.config.frame_skip,
+                trans_threshold=self.config.stability_trans_threshold,
+                jump_threshold=self.config.stability_jump_threshold,
+                rot_threshold=self.config.stability_rot_threshold,
+                variance_threshold=self.config.stability_variance_threshold,
+                w_trans=self.config.stability_w_trans,
+                w_var=self.config.stability_w_var,
+                w_rot=self.config.stability_w_rot,
+                w_jump=self.config.stability_w_jump,
+                max_corners=self.config.stability_max_corners,
+                lk_win_size=self.config.stability_lk_win_size,
+                lk_max_level=self.config.stability_lk_max_level,
+                target_fps=self.config.stability_target_fps,
+            )
+            t_stab = time.perf_counter() - t_stab
+            t_froz = time.perf_counter()
+            frozen = check_frozen_segments(
+                video_path,
+                max_consecutive=self.config.frozen_max_consecutive,
+                ssim_threshold=self.config.frozen_ssim_threshold,
+                target_fps=self.config.frozen_target_fps,
+            )
+            t_froz = time.perf_counter() - t_froz
+            return stability, frozen, t_stab, t_froz
+
+        if self.config.fail_fast:
+            # Sequential: run motion first, gate ML on result
+            stability_result, frozen_result, t_stab, t_froz = _run_motion()
+            results["motion_camera_stability"] = stability_result
+            results["motion_frozen_segments"] = frozen_result
+            timings["camera_stability"] = t_stab
+            timings["frozen_segments"] = t_froz
+            print(f"Motion analysis ({t_stab:.2f}s stability, {t_froz:.2f}s frozen)")
+
+            failed_motion = [
+                k for k in ["motion_camera_stability", "motion_frozen_segments"]
+                if results[k].status == "fail"
+            ]
+            if failed_motion:
+                print(f"  Fail-fast: skipping ML ({', '.join(failed_motion)} failed)")
+                ml_keys = [k for k in NON_META_CHECK_KEYS if k.startswith("ml_")]
+                for key in ml_keys:
+                    results[key] = CheckResult(
+                        status="skipped", metric_value=0.0, confidence=1.0,
+                        details={"reason": f"fail-fast: {', '.join(failed_motion)} failed"},
+                    )
+                return results
+            motion_future = None
+        else:
+            # Parallel: launch motion in background thread
+            motion_executor = ThreadPoolExecutor(max_workers=1)
+            motion_future = motion_executor.submit(_run_motion)
+
+        # ML inference runs in the main thread
         if not self._models_loaded:
             self.load_models()
 
@@ -265,52 +327,110 @@ class ValidationPipeline:
         per_frame_poses = []
         flagged_for_gdino = []
 
-        from ml_checks.models.yolo_detector import PERSON_CLASS, SENSITIVE_CLASSES
+        t_scrfd = 0.0
+        t_yolo = 0.0
+        t_pose = 0.0
+        t_hands23 = 0.0
 
-        t_scrfd = 0
-        t_yolo = 0
-        t_pose = 0
-        t_hands23 = 0
+        # Early stopping monitor
+        monitor = EarlyStopMonitor(len(frames), [
+            CheckSpec("hand_visibility", self.config.hand_pass_rate, False),
+            CheckSpec("face_presence", 1.0, True),
+            CheckSpec("participants", self.config.participant_pass_rate, False),
+            CheckSpec("hand_object_interaction", self.config.interaction_pass_rate, False),
+            CheckSpec("pov_hand_angle", self.config.angle_pass_rate, False),
+            CheckSpec("body_part_visibility", self.config.body_part_pass_rate, False),
+            CheckSpec("privacy_safety", 1.0, True),
+        ])
 
-        for i, frame in enumerate(frames):
+        total_frames = len(frames)
+        frames_inferred = 0
+
+        for batch_start in range(0, total_frames, _BATCH_SIZE):
+            if monitor.all_determined():
+                break
+
+            batch_end = min(batch_start + _BATCH_SIZE, total_frames)
+            batch_frames = frames[batch_start:batch_end]
+
+            # Batched YOLO inference
             t0 = time.perf_counter()
-            faces = self.face_detector.detect(frame)
-            t_scrfd += time.perf_counter() - t0
-            per_frame_faces.append(faces)
-
-            t0 = time.perf_counter()
-            yolo_dets = self.yolo_detector.detect(frame)
+            batch_yolo = self.yolo_detector.detect_batch(batch_frames)
             t_yolo += time.perf_counter() - t0
-            per_frame_yolo.append(yolo_dets)
-            per_frame_yolo_persons.append(self.yolo_detector.get_persons(yolo_dets))
-            sensitive = self.yolo_detector.get_sensitive_objects(yolo_dets)
-            per_frame_yolo_sensitive.append(sensitive)
-            if sensitive:
-                flagged_for_gdino.append(i)
 
             t0 = time.perf_counter()
-            poses = self.pose_detector.detect(frame)
+            batch_poses = self.pose_detector.detect_batch(batch_frames)
             t_pose += time.perf_counter() - t0
-            per_frame_poses.append(poses)
 
-            t0 = time.perf_counter()
-            hands, objects = self.hand_detector.detect(frame)
-            t_hands23 += time.perf_counter() - t0
-            per_frame_hands.append(hands)
-            per_frame_objects.append(objects)
+            # Per-frame inference for SCRFD + Hands23 (no batch API)
+            for j, frame in enumerate(batch_frames):
+                i = batch_start + j  # global frame index
 
-            if (i + 1) % 10 == 0 or i == len(frames) - 1:
-                print(f"  Processed frame {i + 1}/{len(frames)}")
+                t0 = time.perf_counter()
+                faces = self.face_detector.detect(frame)
+                t_scrfd += time.perf_counter() - t0
+                per_frame_faces.append(faces)
+
+                yolo_dets = batch_yolo[j]
+                per_frame_yolo.append(yolo_dets)
+                persons = self.yolo_detector.get_persons(yolo_dets)
+                per_frame_yolo_persons.append(persons)
+                sensitive = self.yolo_detector.get_sensitive_objects(yolo_dets)
+                per_frame_yolo_sensitive.append(sensitive)
+                if sensitive:
+                    flagged_for_gdino.append(i)
+
+                poses = batch_poses[j]
+                per_frame_poses.append(poses)
+
+                t0 = time.perf_counter()
+                hands, objects = self.hand_detector.detect(frame)
+                t_hands23 += time.perf_counter() - t0
+                per_frame_hands.append(hands)
+                per_frame_objects.append(objects)
+
+                # Update early stop monitor
+                monitor.update("hand_visibility",
+                    eval_hand_visibility(hands, self.config.hand_confidence_threshold))
+                monitor.update("face_presence",
+                    eval_face_presence(faces, self.config.face_confidence_threshold))
+                monitor.update("participants",
+                    eval_participants(persons, faces, hands, frame_h, frame_w,
+                        self.config.person_confidence_threshold, 0.5, 0.15))
+                monitor.update("hand_object_interaction",
+                    eval_hand_object_interaction(hands))
+                monitor.update("pov_hand_angle",
+                    eval_pov_hand_angle(hands, frame_h, frame_w,
+                        self.config.angle_threshold, self.config.diagonal_fov_degrees))
+                monitor.update("body_part_visibility",
+                    eval_body_part_visibility(poses, hands, frame_h, frame_w,
+                        0.4, self.config.body_part_keypoint_conf))
+                monitor.update("privacy_safety",
+                    eval_privacy_safety(sensitive, self.config.privacy_yolo_threshold))
+
+                monitor.advance_frame()
+                frames_inferred = i + 1
+
+                if (frames_inferred) % 10 == 0 or frames_inferred == total_frames:
+                    print(f"  Processed frame {frames_inferred}/{total_frames}")
+
+                if monitor.all_determined():
+                    break
+
+        if frames_inferred < total_frames:
+            print(f"  Early stopped at frame {frames_inferred}/{total_frames} "
+                  f"(all checks determined)")
 
         timings["scrfd"] = t_scrfd
         timings["yolo"] = t_yolo
         timings["yolo_pose"] = t_pose
         timings["hands23"] = t_hands23
 
-        # Grounding DINO on flagged frames
-        per_frame_gdino = [[] for _ in frames]
-        t_gdino = 0
-        if self.gdino_detector and flagged_for_gdino:
+        # Grounding DINO on flagged frames (skip if privacy already failed)
+        per_frame_gdino = [[] for _ in range(len(per_frame_yolo_sensitive))]
+        t_gdino = 0.0
+        privacy_status, _, _ = monitor.get_result("privacy_safety")
+        if self.gdino_detector and flagged_for_gdino and privacy_status != "fail":
             print(f"  Running Grounding DINO on {len(flagged_for_gdino)} flagged frames...")
             for idx in flagged_for_gdino:
                 t0 = time.perf_counter()
@@ -323,61 +443,144 @@ class ValidationPipeline:
                 per_frame_gdino[idx] = gdino_dets
         timings["grounding_dino"] = t_gdino
 
+        # ── Collect motion analysis results (if ran in parallel) ──
+        if motion_future is not None:
+            stability_result, frozen_result, t_stab, t_froz = motion_future.result()
+            motion_executor.shutdown(wait=False)
+            results["motion_camera_stability"] = stability_result
+            results["motion_frozen_segments"] = frozen_result
+            timings["camera_stability"] = t_stab
+            timings["frozen_segments"] = t_froz
+            print(f"Motion analysis ({t_stab:.2f}s stability, {t_froz:.2f}s frozen)")
+
         # ── Step 6: ML checks ────────────────────────────────────
+        # For determined checks, build results directly from monitor.
+        # For undetermined checks (all frames processed), use original functions.
         print("Running ML checks...")
 
-        results["ml_face_presence"] = check_face_presence(
-            per_frame_faces,
-            confidence_threshold=self.config.face_confidence_threshold,
-        )
+        _es_details = {"early_stopped": True, "frames_inferred": frames_inferred,
+                       "total_frames": total_frames}
 
-        results["ml_participants"] = check_participants(
-            per_frame_yolo_persons,
-            per_frame_faces,
-            per_frame_hands,
-            frame_dims=(frame_h, frame_w),
-            pass_rate_threshold=self.config.participant_pass_rate,
-            person_conf_threshold=self.config.person_confidence_threshold,
-        )
+        # -- face_presence
+        status, passes, processed = monitor.get_result("face_presence")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_face_presence"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_face_presence"] = check_face_presence(
+                per_frame_faces,
+                confidence_threshold=self.config.face_confidence_threshold,
+            )
 
-        results["ml_hand_visibility"] = check_hand_visibility(
-            per_frame_hands,
-            confidence_threshold=self.config.hand_confidence_threshold,
-            pass_rate_threshold=self.config.hand_pass_rate,
-        )
+        # -- participants
+        status, passes, processed = monitor.get_result("participants")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_participants"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_participants"] = check_participants(
+                per_frame_yolo_persons, per_frame_faces, per_frame_hands,
+                frame_dims=(frame_h, frame_w),
+                pass_rate_threshold=self.config.participant_pass_rate,
+                person_conf_threshold=self.config.person_confidence_threshold,
+            )
 
-        results["ml_hand_object_interaction"] = check_hand_object_interaction(
-            per_frame_hands,
-            pass_rate_threshold=self.config.interaction_pass_rate,
-        )
+        # -- hand_visibility
+        status, passes, processed = monitor.get_result("hand_visibility")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_hand_visibility"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "both_hands_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_hand_visibility"] = check_hand_visibility(
+                per_frame_hands,
+                confidence_threshold=self.config.hand_confidence_threshold,
+                pass_rate_threshold=self.config.hand_pass_rate,
+            )
 
-        results["ml_privacy_safety"] = check_privacy_safety(
-            per_frame_yolo_sensitive,
-            per_frame_gdino if self.gdino_detector else None,
-            yolo_conf_threshold=self.config.privacy_yolo_threshold,
-            gdino_conf_threshold=self.config.privacy_gdino_threshold,
-        )
+        # -- hand_object_interaction
+        status, passes, processed = monitor.get_result("hand_object_interaction")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_hand_object_interaction"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "interaction_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_hand_object_interaction"] = check_hand_object_interaction(
+                per_frame_hands,
+                pass_rate_threshold=self.config.interaction_pass_rate,
+            )
 
+        # -- privacy_safety (may need GDINO data)
+        status, passes, processed = monitor.get_result("privacy_safety")
+        if status == "fail" and frames_inferred < total_frames:
+            results["ml_privacy_safety"] = CheckResult(
+                status="fail",
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_privacy_safety"] = check_privacy_safety(
+                per_frame_yolo_sensitive,
+                per_frame_gdino if self.gdino_detector else None,
+                yolo_conf_threshold=self.config.privacy_yolo_threshold,
+                gdino_conf_threshold=self.config.privacy_gdino_threshold,
+            )
+
+        # -- view_obstruction (CPU-only, no ML models, no early stopping)
         results["ml_view_obstruction"] = check_view_obstruction(
             frames,
             max_obstructed_ratio=self.config.obstruction_max_ratio,
         )
 
-        results["ml_pov_hand_angle"] = check_pov_hand_angle(
-            per_frame_hands,
-            frame_dims=(frame_h, frame_w),
-            angle_threshold=self.config.angle_threshold,
-            pass_rate_threshold=self.config.angle_pass_rate,
-            diagonal_fov_degrees=self.config.diagonal_fov_degrees,
-        )
+        # -- pov_hand_angle
+        status, passes, processed = monitor.get_result("pov_hand_angle")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_pov_hand_angle"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "passing_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_pov_hand_angle"] = check_pov_hand_angle(
+                per_frame_hands,
+                frame_dims=(frame_h, frame_w),
+                angle_threshold=self.config.angle_threshold,
+                pass_rate_threshold=self.config.angle_pass_rate,
+                diagonal_fov_degrees=self.config.diagonal_fov_degrees,
+            )
 
-        results["ml_body_part_visibility"] = check_body_part_visibility(
-            per_frame_poses,
-            per_frame_hands,
-            frame_dims=(frame_h, frame_w),
-            pass_rate_threshold=self.config.body_part_pass_rate,
-            keypoint_conf_threshold=self.config.body_part_keypoint_conf,
-        )
+        # -- body_part_visibility
+        status, passes, processed = monitor.get_result("body_part_visibility")
+        if status is not None and frames_inferred < total_frames:
+            results["ml_body_part_visibility"] = CheckResult(
+                status=status,
+                metric_value=round(passes / processed, 4) if processed else 0.0,
+                confidence=1.0,
+                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
+            )
+        else:
+            results["ml_body_part_visibility"] = check_body_part_visibility(
+                per_frame_poses, per_frame_hands,
+                frame_dims=(frame_h, frame_w),
+                pass_rate_threshold=self.config.body_part_pass_rate,
+                keypoint_conf_threshold=self.config.body_part_keypoint_conf,
+            )
 
         # ── Summary ──────────────────────────────────────────────
         total_time = sum(timings.values())
@@ -390,11 +593,13 @@ class ValidationPipeline:
         print(f"  Camera stability: {timings['camera_stability']:.2f}s")
         print(f"  Frozen segments:  {timings['frozen_segments']:.2f}s")
         print(f"  SCRFD:            {timings['scrfd']:.2f}s")
-        print(f"  YOLO11m:          {timings['yolo']:.2f}s")
-        print(f"  YOLO11m-pose:     {timings['yolo_pose']:.2f}s")
+        print(f"  YOLO:             {timings['yolo']:.2f}s")
+        print(f"  YOLO-pose:        {timings['yolo_pose']:.2f}s")
         print(f"  Hands23:          {timings['hands23']:.2f}s")
         print(f"  Grounding DINO:   {timings['grounding_dino']:.2f}s")
         print(f"  TOTAL:            {total_time:.2f}s")
+        if frames_inferred < total_frames:
+            print(f"  (early stopped at {frames_inferred}/{total_frames} frames)")
 
         print(f"\nCheck results:")
         for name, result in results.items():

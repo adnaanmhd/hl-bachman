@@ -208,13 +208,15 @@ def check_camera_stability(
     max_corners: int = 300,
     lk_win_size: tuple[int, int] = (21, 21),
     lk_max_level: int = 3,
+    # FPS cap
+    target_fps: float = 30.0,
 ) -> CheckResult:
     """Two-stage camera shakiness detection using sparse Lucas-Kanade optical flow.
 
-    Stage 1: Fast pre-screen at downscaled resolution, every Nth frame.
+    Stage 1: Fast pre-screen at downscaled resolution, subsampled to target_fps.
              Produces per-second shakiness scores.
-    Stage 2: Full-resolution analysis on seconds flagged by Stage 1.
-             Overrides Stage 1 scores for those seconds.
+    Stage 2: Full-resolution analysis on seconds flagged by Stage 1,
+             also capped at target_fps.
 
     Pass if overall_score <= shaky_score_threshold.
 
@@ -225,7 +227,7 @@ def check_camera_stability(
         deep_score_threshold: Stage-1 score above this queues the second
             for Stage-2 deep analysis.
         fast_scale: Downscale factor for Stage 1 (e.g. 0.333 = ~360p).
-        frame_skip: Analyse every Nth frame in Stage 1.
+        frame_skip: Base frame skip for Stage 1 (multiplied by fps_skip).
         trans_threshold: Translation px/frame threshold (native res).
         jump_threshold: Sudden jolt px/frame threshold.
         rot_threshold: Rotation degrees/frame threshold.
@@ -237,6 +239,7 @@ def check_camera_stability(
         max_corners: Max corners for goodFeaturesToTrack.
         lk_win_size: Lucas-Kanade window size.
         lk_max_level: Lucas-Kanade pyramid levels.
+        target_fps: Max analysis FPS — videos above this are subsampled.
     """
     video_path = str(video_path)
     cap = cv2.VideoCapture(video_path)
@@ -247,6 +250,11 @@ def check_camera_stability(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_per_sec = int(fps)
     total_seconds = total_frames / fps
+
+    # FPS-based subsampling: if native > target, increase frame_skip
+    fps_skip = max(1, round(fps / target_fps))
+    effective_stage1_skip = frame_skip * fps_skip
+    effective_stage2_skip = fps_skip  # Stage 2 was frame_skip=1, now fps_skip
 
     # Shared kwargs for scoring
     score_kwargs = dict(
@@ -269,11 +277,11 @@ def check_camera_stability(
             break
 
         score, _ = _analyse_segment(
-            cap, sf, ef, scale=fast_scale, frame_skip=frame_skip,
+            cap, sf, ef, scale=fast_scale, frame_skip=effective_stage1_skip,
             **score_kwargs,
         )
         stage1_scores[sec] = score
-        stage1_frame_count += (ef - sf) // frame_skip
+        stage1_frame_count += max(1, (ef - sf) // effective_stage1_skip)
 
         if score >= deep_score_threshold:
             deep_queue.append(sec)
@@ -288,11 +296,11 @@ def check_camera_stability(
             ef = min(sf + frames_per_sec, total_frames)
 
             score, _ = _analyse_segment(
-                cap, sf, ef, scale=1.0, frame_skip=1,
+                cap, sf, ef, scale=1.0, frame_skip=effective_stage2_skip,
                 **score_kwargs,
             )
             stage2_scores[sec] = score
-            stage2_frame_count += (ef - sf)
+            stage2_frame_count += max(1, (ef - sf) // effective_stage2_skip)
 
     cap.release()
 
@@ -320,6 +328,11 @@ def check_camera_stability(
             "stage2_seconds_flagged": len(deep_queue),
             "fast_scale": fast_scale,
             "frame_skip": frame_skip,
+            "native_fps": round(fps, 2),
+            "target_fps": target_fps,
+            "fps_skip": fps_skip,
+            "effective_stage1_skip": effective_stage1_skip,
+            "effective_stage2_skip": effective_stage2_skip,
         },
     )
 
@@ -331,23 +344,26 @@ def check_frozen_segments(
     max_consecutive: int = 30,
     ssim_threshold: float = 0.99,
     downscale_height: int = 480,
+    target_fps: float = 10.0,
 ) -> CheckResult:
-    """Check for frozen segments by reading video at native FPS.
+    """Check for frozen segments by subsampling at target_fps.
 
-    Streams frames sequentially and computes SSIM between consecutive pairs.
-    Fails if any run of consecutive frames exceeds max_consecutive with
-    SSIM > ssim_threshold.
+    Reads every Nth frame (N = native_fps / target_fps) and computes SSIM
+    between consecutive sampled pairs.  Fails if any run of consecutive
+    sampled frames exceeds the scaled threshold.
 
     Optimizations:
+    - Subsample at target_fps instead of reading every native frame.
     - Downscale to 480p grayscale before SSIM.
     - Fast pre-filter: skip SSIM if mean absolute difference > 5.
     - Streams 2 frames at a time (constant memory).
 
     Args:
         video_path: Path to video file.
-        max_consecutive: Max allowed consecutive frozen frames.
+        max_consecutive: Max allowed consecutive frozen frames (at native FPS).
         ssim_threshold: SSIM above this = frozen.
         downscale_height: Height to downscale to before comparison.
+        target_fps: Target sampling rate for frozen detection (default 10).
     """
     video_path = str(video_path)
     cap = cv2.VideoCapture(video_path)
@@ -356,7 +372,13 @@ def check_frozen_segments(
         raise ValueError(f"Cannot open video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    native_fps = cap.get(cv2.CAP_PROP_FPS)
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    # Subsampling: read every frame_step-th frame
+    frame_step = max(1, round(native_fps / target_fps))
+    effective_fps = native_fps / frame_step
+    # Scale the threshold proportionally to the sampling rate
+    effective_max = max(1, round(max_consecutive * effective_fps / native_fps))
 
     # Read first frame
     ret, prev_frame = cap.read()
@@ -369,15 +391,21 @@ def check_frozen_segments(
 
     current_run = 0
     longest_run = 0
-    frozen_segments = []  # (start_frame, length)
+    frozen_segments = []
     run_start = 0
-    frames_read = 1
+    frames_sampled = 1
+    frame_idx = 0  # native frame index of last read
 
     while True:
+        # Skip ahead by frame_step
+        frame_idx += frame_step
+        if frame_idx >= total_frames:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, curr_frame = cap.read()
         if not ret:
             break
-        frames_read += 1
+        frames_sampled += 1
 
         curr_gray = _downscale_gray(curr_frame, downscale_height)
 
@@ -394,14 +422,14 @@ def check_frozen_segments(
 
         if is_frozen:
             if current_run == 0:
-                run_start = frames_read - 2
+                run_start = frame_idx - frame_step
             current_run += 1
         else:
             if current_run > 0:
                 if current_run > longest_run:
                     longest_run = current_run
-                if current_run > max_consecutive:
-                    frozen_segments.append({"start_frame": run_start, "length": current_run})
+                if current_run > effective_max:
+                    frozen_segments.append({"start_frame": run_start, "length_sampled": current_run})
                 current_run = 0
 
         prev_gray = curr_gray
@@ -410,25 +438,35 @@ def check_frozen_segments(
     if current_run > 0:
         if current_run > longest_run:
             longest_run = current_run
-        if current_run > max_consecutive:
-            frozen_segments.append({"start_frame": run_start, "length": current_run})
+        if current_run > effective_max:
+            frozen_segments.append({"start_frame": run_start, "length_sampled": current_run})
 
     cap.release()
 
-    passes = longest_run <= max_consecutive
-    metric = longest_run / max_consecutive if max_consecutive > 0 else 0.0
+    passes = longest_run <= effective_max
+    metric = longest_run / effective_max if effective_max > 0 else 0.0
+
+    # Convert sampled run length back to estimated native-fps duration
+    longest_run_native_est = longest_run * frame_step
+    frozen_duration_s = round(longest_run_native_est / native_fps, 2) if native_fps > 0 else 0
 
     return CheckResult(
         status="pass" if passes else "fail",
-        metric_value=round(min(metric, 10.0), 4),  # cap at 10x for readability
+        metric_value=round(min(metric, 10.0), 4),
         confidence=1.0,
         details={
-            "longest_frozen_run": longest_run,
-            "max_consecutive_allowed": max_consecutive,
+            "longest_frozen_run_sampled": longest_run,
+            "longest_frozen_run_native_est": longest_run_native_est,
+            "effective_max_consecutive": effective_max,
+            "max_consecutive_native": max_consecutive,
             "ssim_threshold": ssim_threshold,
-            "total_frames_read": frames_read,
+            "frames_sampled": frames_sampled,
+            "total_native_frames": total_frames,
             "native_fps": round(native_fps, 2),
-            "frozen_duration_s": round(longest_run / native_fps, 2) if native_fps > 0 else 0,
+            "target_fps": target_fps,
+            "effective_fps": round(effective_fps, 2),
+            "frame_step": frame_step,
+            "frozen_duration_s": frozen_duration_s,
             "frozen_segments": frozen_segments[:10],
         },
     )

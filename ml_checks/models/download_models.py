@@ -32,10 +32,22 @@ def download_scrfd():
     return app
 
 
-def download_yolo11m():
-    """Download YOLO11m model."""
+def download_yolo11s():
+    """Download YOLO11s model (default for object detection)."""
     print("\n" + "=" * 60)
-    print("2. YOLO11m Object Detector")
+    print("2a. YOLO11s Object Detector")
+    print("=" * 60)
+    from ultralytics import YOLO
+
+    model = YOLO("yolo11s.pt")
+    print(f"YOLO11s loaded: {model.model_name}")
+    return model
+
+
+def download_yolo11m():
+    """Download YOLO11m model (optional, larger variant)."""
+    print("\n" + "=" * 60)
+    print("2b. YOLO11m Object Detector")
     print("=" * 60)
     from ultralytics import YOLO
 
@@ -306,7 +318,7 @@ if __name__ == "__main__":
     print(f"Models directory: {MODELS_DIR}\n")
 
     download_scrfd()
-    download_yolo11m()
+    download_yolo11s()
     download_yolo11m_pose()
     download_grounding_dino()
     download_hands23()

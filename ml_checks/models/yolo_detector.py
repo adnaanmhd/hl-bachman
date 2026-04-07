@@ -75,6 +75,40 @@ class YOLODetector:
                 )
         return detections
 
+    def detect_batch(self, frames_bgr: list[np.ndarray]) -> list[list[Detection]]:
+        """Run object detection on a batch of BGR frames.
+
+        Args:
+            frames_bgr: List of OpenCV BGR images.
+
+        Returns:
+            List of detection lists, one per input frame.
+        """
+        if not frames_bgr:
+            return []
+        results = self.model.predict(
+            frames_bgr,
+            conf=self.conf_threshold,
+            imgsz=self.imgsz,
+            verbose=False,
+        )
+        batch_detections = []
+        for r in results:
+            frame_dets = []
+            if r.boxes is not None:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    frame_dets.append(
+                        Detection(
+                            bbox=box.xyxy[0].cpu().numpy(),
+                            confidence=float(box.conf[0]),
+                            class_id=cls_id,
+                            class_name=r.names[cls_id],
+                        )
+                    )
+            batch_detections.append(frame_dets)
+        return batch_detections
+
     def get_persons(self, detections: list[Detection], min_conf: float = 0.4) -> list[Detection]:
         """Filter person detections."""
         return [d for d in detections if d.class_id == PERSON_CLASS and d.confidence >= min_conf]

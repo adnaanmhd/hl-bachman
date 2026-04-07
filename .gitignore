@@ -14,6 +14,7 @@ build/
 ml_checks/models/weights/
 yolo11m.pt
 yolo11m-pose.pt
+yolo11s.pt
 yolo11m.onnx
 
 # Sample data and test outputs
@@ -33,6 +34,7 @@ ml_checks/tests/pipeline_results*.md
 idea-brief.md
 style-guide.md
 pla.md
+research/
 
 # OS
 .DS_Store

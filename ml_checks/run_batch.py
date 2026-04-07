@@ -16,12 +16,15 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from datetime import datetime
+from multiprocessing import Pool
 
 # Ensure project root is on path
 ROOT = Path(__file__).parent.parent
@@ -278,6 +281,79 @@ def _get_display_name(key: str) -> str:
     return key
 
 
+def _auto_detect_workers() -> int:
+    """Determine worker count based on available resources."""
+    cpu_count = os.cpu_count() or 1
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            # ~3 GB VRAM per worker for all models
+            return max(1, min(int(vram_gb // 3), cpu_count // 2, 4))
+    except ImportError:
+        pass
+    # CPU-only: conservative (each worker loads all models, ~4-6 GB RAM)
+    return max(1, min(cpu_count // 4, 4))
+
+
+def _process_video_worker(args_tuple: tuple) -> dict:
+    """Process a single video in a worker process.
+
+    Each worker creates its own pipeline instance and loads models independently.
+    """
+    video_path_str, config_dict, output_dir_str = args_tuple
+    video_path = Path(video_path_str)
+    output_dir = Path(output_dir_str)
+
+    # Reconstruct config (tuples become lists via asdict, fix lk_win_size)
+    if "stability_lk_win_size" in config_dict and isinstance(config_dict["stability_lk_win_size"], list):
+        config_dict["stability_lk_win_size"] = tuple(config_dict["stability_lk_win_size"])
+    config = PipelineConfig(**config_dict)
+    pipeline = ValidationPipeline(config)
+
+    entry = {
+        "filename": video_path.name,
+        "path": str(video_path),
+    }
+
+    try:
+        metadata = get_video_metadata(str(video_path))
+        entry["video_meta"] = metadata
+
+        t0 = time.perf_counter()
+        results = pipeline.process_video(str(video_path))
+        elapsed = time.perf_counter() - t0
+
+        entry["processing_time_s"] = round(elapsed, 2)
+
+        lb_result = results.get("luminance_blur")
+        if lb_result and lb_result.details:
+            entry["frames_sampled"] = lb_result.details.get("total_frames", "N/A")
+        else:
+            entry["frames_sampled"] = "N/A (metadata failed)"
+
+        entry["results"] = {}
+        for name, r in results.items():
+            entry["results"][name] = {
+                "status": r.status,
+                "metric_value": r.metric_value,
+                "confidence": r.confidence,
+                "details": r.details,
+            }
+
+    except Exception as e:
+        entry["error"] = str(e)
+        entry["processing_time_s"] = 0.0
+        traceback.print_exc()
+
+    # Save per-video JSON
+    video_json = output_dir / f"{video_path.stem}.json"
+    with open(video_json, "w") as f:
+        json.dump(entry, f, indent=2, default=str)
+
+    return entry
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run validation pipeline on a batch of videos.",
@@ -298,6 +374,9 @@ Examples:
     parser.add_argument("--hand-detector-repo", default="ml_checks/models/weights/hands23_detector", help="Path to Hands23 repo")
     parser.add_argument("--scrfd-root", default="ml_checks/models/weights/insightface", help="Path to InsightFace models")
     parser.add_argument("--gdino-cache", default="ml_checks/models/weights/grounding_dino", help="Path to Grounding DINO cache")
+    parser.add_argument("--fail-fast", action="store_true", default=False, help="Skip ML inference when quality checks fail")
+    parser.add_argument("--workers", type=int, default=0, help="Parallel video workers (0=auto-detect, 1=sequential)")
+    parser.add_argument("--yolo-model", default="yolo11s.pt", help="YOLO model for object detection (default: yolo11s.pt)")
 
     args = parser.parse_args()
 
@@ -338,65 +417,80 @@ Examples:
         scrfd_root=args.scrfd_root,
         hand_detector_repo=args.hand_detector_repo,
         gdino_cache=args.gdino_cache,
+        fail_fast=args.fail_fast,
+        yolo_model=args.yolo_model,
     )
 
-    # Initialize pipeline (models loaded lazily on first non-metadata-failing video)
-    pipeline = ValidationPipeline(config)
+    # Determine worker count
+    workers = args.workers if args.workers > 0 else _auto_detect_workers()
+    print(f"Using {workers} worker(s)")
 
-    # Process each video
+    # Process videos
     all_results = []
 
-    for i, video_path in enumerate(videos):
-        print(f"\n{'='*70}")
-        print(f"[{i+1}/{len(videos)}] {video_path.name}")
-        print(f"{'='*70}")
+    if workers <= 1:
+        # Sequential: single pipeline instance, models loaded once
+        pipeline = ValidationPipeline(config)
 
-        entry = {
-            "filename": video_path.name,
-            "path": str(video_path),
-        }
+        for i, video_path in enumerate(videos):
+            print(f"\n{'='*70}")
+            print(f"[{i+1}/{len(videos)}] {video_path.name}")
+            print(f"{'='*70}")
 
-        try:
-            # Get metadata for report header
-            metadata = get_video_metadata(str(video_path))
-            entry["video_meta"] = metadata
+            entry = {
+                "filename": video_path.name,
+                "path": str(video_path),
+            }
 
-            # Run full pipeline
-            t0 = time.perf_counter()
-            results = pipeline.process_video(str(video_path))
-            elapsed = time.perf_counter() - t0
+            try:
+                metadata = get_video_metadata(str(video_path))
+                entry["video_meta"] = metadata
 
-            entry["processing_time_s"] = round(elapsed, 2)
+                t0 = time.perf_counter()
+                results = pipeline.process_video(str(video_path))
+                elapsed = time.perf_counter() - t0
 
-            # Count sampled frames from luminance_blur check details if available
-            lb_result = results.get("luminance_blur")
-            if lb_result and lb_result.details:
-                entry["frames_sampled"] = lb_result.details.get("total_frames", "N/A")
-            else:
-                entry["frames_sampled"] = "N/A (metadata failed)"
+                entry["processing_time_s"] = round(elapsed, 2)
 
-            # Serialize results
-            entry["results"] = {}
-            for name, r in results.items():
-                entry["results"][name] = {
-                    "status": r.status,
-                    "metric_value": r.metric_value,
-                    "confidence": r.confidence,
-                    "details": r.details,
-                }
+                lb_result = results.get("luminance_blur")
+                if lb_result and lb_result.details:
+                    entry["frames_sampled"] = lb_result.details.get("total_frames", "N/A")
+                else:
+                    entry["frames_sampled"] = "N/A (metadata failed)"
 
-        except Exception as e:
-            entry["error"] = str(e)
-            entry["processing_time_s"] = 0.0
-            import traceback
-            traceback.print_exc()
+                entry["results"] = {}
+                for name, r in results.items():
+                    entry["results"][name] = {
+                        "status": r.status,
+                        "metric_value": r.metric_value,
+                        "confidence": r.confidence,
+                        "details": r.details,
+                    }
 
-        all_results.append(entry)
+            except Exception as e:
+                entry["error"] = str(e)
+                entry["processing_time_s"] = 0.0
+                traceback.print_exc()
 
-        # Save per-video JSON
-        video_json = output_dir / f"{video_path.stem}.json"
-        with open(video_json, "w") as f:
-            json.dump(entry, f, indent=2, default=str)
+            all_results.append(entry)
+
+            video_json = output_dir / f"{video_path.stem}.json"
+            with open(video_json, "w") as f:
+                json.dump(entry, f, indent=2, default=str)
+    else:
+        # Parallel: each worker loads its own pipeline and models
+        config_dict = dataclasses.asdict(config)
+        work_items = [
+            (str(v), config_dict, str(output_dir)) for v in videos
+        ]
+
+        print(f"Processing {len(videos)} videos with {workers} parallel workers...")
+        with Pool(processes=workers) as pool:
+            for i, entry in enumerate(pool.imap_unordered(_process_video_worker, work_items)):
+                all_results.append(entry)
+                status = "error" if "error" in entry else "done"
+                t = entry.get("processing_time_s", 0)
+                print(f"  [{i+1}/{len(videos)}] {entry['filename']} ({status}, {t:.1f}s)")
 
     # Write batch report
     report_path = write_report(all_results, output_dir, config)
