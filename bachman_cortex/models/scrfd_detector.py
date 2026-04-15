@@ -31,15 +31,23 @@ class SCRFDDetector:
         available = set(onnxruntime.get_available_providers())
         if "CUDAExecutionProvider" in available:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            # HEURISTIC avoids the multi-second EXHAUSTIVE autotune that
+            # ORT runs on the first inference for each new input shape.
+            provider_options = [
+                {"cudnn_conv_algo_search": "HEURISTIC"},
+                {},
+            ]
             ctx_id = 0
         else:
             providers = ["CPUExecutionProvider"]
+            provider_options = [{}]
             ctx_id = -1
 
         self.app = FaceAnalysis(
             name=model_name,
             root=str(root),
             providers=providers,
+            provider_options=provider_options,
         )
         self.app.prepare(ctx_id=ctx_id, det_size=det_size)
 

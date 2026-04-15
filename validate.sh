@@ -40,9 +40,9 @@ if [ "$SETUP_ONLY" -eq 0 ] && [ "${#PIPELINE_ARGS[@]}" -eq 0 ]; then
     echo "Options (passed through to hl-validate):"
     echo "  --output, -o DIR    Output directory (default: bachman_cortex/results)"
     echo "  --fps N             Sampling FPS (default: 1.0)"
-    echo "  --max-frames N      Max frames to sample per video"
-    echo "  --no-gdino          Disable Grounding DINO (faster)"
-    echo "  --fail-fast         Skip ML inference when quality checks fail"
+    echo "  --min-segment N     Minimum checkable segment duration in seconds (default: 59)"
+    echo "  --min-bad-segment N Bad segments with duration > N seconds are kept; shorter or equal ones are forgiven (default: 2)"
+    echo "  --hevc-to-h264      Before Phase 0, losslessly transcode HEVC inputs to H.264 (strips rotation tag; disabled by default)"
     echo "  --workers N         Parallel video workers (0=auto, 1=sequential)"
     echo "  --yolo-model FILE   YOLO model for object detection (default: yolo11s.pt)"
     echo ""
@@ -205,7 +205,10 @@ fi
 # ─────────────────────────────────────────────────────────────
 
 info "Installing hl-video-validation package..."
-pip install -e "$SCRIPT_DIR" --quiet 2>/dev/null
+if ! pip install -e "$SCRIPT_DIR" --quiet; then
+    error "Failed to install hl-video-validation package."
+    exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────
 # Step 7: Download model weights

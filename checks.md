@@ -1,31 +1,80 @@
-# Video Validation Checks
+# Validation & Processing Pipeline — Check Specifications
 
-## Video Metadata
+The pipeline operates in 4 phases to classify every time range in an
+egocentric video as **USABLE**, **UNUSABLE**, or **REJECTED**. No clip
+files are produced — the output is a timestamped report.
+
+## Phase 0: Video Metadata (gate — failure rejects entire video)
 
 | Check       | Acceptance Condition                           | How It Is Estimated              |
 | ----------- | ---------------------------------------------- | -------------------------------- |
 | Format      | MP4 container (MPEG-4)                         | Container metadata via FFprobe   |
 | Encoding    | H.264 video codec                              | Codec metadata via FFprobe       |
-| Resolution  | >= 1920 x 1080 pixels                          | Width & height metadata          |
-| Frame Rate  | >= 28 FPS                                      | FPS metadata                     |
-| Duration    | >= 180 seconds                                 | Duration metadata                |
-| Orientation | Rotation = 0 or 180 degrees and width > height | Width, height, rotation metadata |
+| Resolution  | Displayed dims >= 1920 x 1080 (rotation applied)                    | Width & height metadata          |
+| Frame Rate  | >= 28 FPS                                                           | FPS metadata                     |
+| Duration    | >= 119 seconds                                                      | Duration metadata                |
+| Orientation | Rotation in {0, 90, 270} and displayed width > displayed height     | Width, height, rotation metadata |
 
-## Motion Analysis
+## Phase 1: Segment Filtering (face, participants)
 
-| Check            | Acceptance Condition                        | How It Is Estimated                          |
-| ---------------- | ------------------------------------------- | -------------------------------------------- |
-| Camera Stability | Two-stage LK shakiness score <= 0.30        | Sparse Lucas-Kanade optical flow (two-stage) |
-| Frozen Segments  | No > 30 consecutive frames with SSIM > 0.99 | Native FPS frame similarity                  |
+Phase 1 scans ALL frames (no early stopping) to identify bad segments. Bad
+segments from both checks are merged (overlapping regions unified), and
+the remaining good segments are filtered by minimum duration (default 60s,
+configurable).
 
-### Camera Stability — Two-Stage Pipeline
+| Check         | Per-Frame Pass Condition                                       | Model           |
+| ------------- | -------------------------------------------------------------- | --------------- |
+| Face Presence | No face detection with confidence >= 0.8                       | SCRFD-2.5GF     |
+| Participants  | Zero other persons detected (wearer's body parts filtered out) | YOLO11s + SCRFD |
 
-**Stage 1 (fast pre-screen):** For each second of video, compute sparse
-Lucas-Kanade optical flow on downscaled frames (~360p via `fast_scale=0.333`)
-at every Nth frame (`frame_skip=2`). An affine transform is estimated via
-RANSAC from tracked corner features, yielding per-frame translation (px) and
-rotation (degrees). These are combined into a per-second shakiness score
-using weighted components:
+### Segment Logic
+
+- **Bad segment:** Contiguous frames that fail any Phase 1 check.
+- **1-second granularity:** Each frame at timestamp T covers \[T, T+1) seconds. A single bad frame = 1-second bad segment.
+- **Forgiveness threshold:** Bad segments with duration <= 2 seconds (configurable via `--min-bad-segment`) are forgiven and treated as good. Segments with duration > 2s are kept. Applied per-check before merging, and again after merging. This prevents isolated single-frame detections from fragmenting the video.
+- **Overlap merging:** Remaining bad segments from both checks are unioned. E.g., face bad \[85s, 89s) + participant bad \[87s, 91s) → merged \[85s, 91s).
+- **Good segments:** The inverse of unified bad segments over \[0, total\_duration].
+- **Checkable segments:** Good segments >= minimum duration threshold (default 60s, configurable via `--min-segment`). These advance to Phase 2.
+- **Discarded segments:** Good segments below the minimum duration threshold. Labeled **UNUSABLE** with reason `segment_too_short` in the timeline (they are not re-validated in Phase 2 because pass-rate metrics are unreliable on <60 frames).
+- **No padding:** Segment boundaries are reported exactly at detected frame timestamps.
+
+## Phase 2: Segment Validation (pass/fail per checkable segment)
+
+Each checkable segment from Phase 1 is validated against all remaining checks.
+Phase 2 is binary pass/fail per segment. Segments that pass all checks are
+labeled **USABLE** in the timeline; segments that fail any check are labeled
+**REJECTED** with the failing check names and observed metrics.
+
+| Check                   | Acceptance Condition                                                                          | Model / Method                                  |
+| ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Luminance & Blur        | (accept + review) frames >= 70% AND brightness std dev <= 60                                  | Tenengrad sharpness + luminance zones           |
+| Camera Stability        | LK shakiness score <= 0.50                                                                    | Sparse Lucas-Kanade optical flow at 0.5x (GPU when available)   |
+| Frozen Segments         | No > 30 consecutive frames with near-zero LK motion (trans < 0.1px, rot < 0.001°)             | LK optical flow signal (zero marginal cost)     |
+| Hand Visibility         | >= 80% frames with both hands fully in frame **OR** >= 90% frames with at least one hand fully in frame (bbox > 0 px from every edge, confidence >= 0.7) | Hands23 detection + bbox edge clearance         |
+| Hand-Object Interaction | Hand contact with portable or stationary object in >= 60% frames                              | Hands23 contact state                           |
+| View Obstruction        | <= 10% frames obstructed                                                                      | OpenCV heuristics                               |
+| POV-Hand Angle          | Hand angle from frame center < 40° in >= 60% frames                                           | Hand bbox center vs frame center                |
+| Face Presence (strict)  | Zero sampled frames in the segment contain a face with confidence >= 0.8                       | SCRFD-2.5GF (detections reused from Phase 1 cache) |
+
+### Camera Stability — Single-Pass LK
+
+LK optical flow is computed **inline with frame extraction** by a
+stateful `MotionAnalyzer` (`bachman_cortex/checks/motion_analysis.py`).
+The video is decoded exactly once (via NVDEC when `cv2.cudacodec` is
+available, else `cv2.VideoCapture`); at every native frame whose index
+is a multiple of `frame_skip = round(native_fps / target_fps)` the
+analyzer:
+
+1. Converts to grayscale and downsamples to ~540p (`fast_scale=0.5`).
+2. Tracks corner features frame-to-frame with sparse Lucas-Kanade (CUDA
+   `cv2.cuda.SparsePyrLKOpticalFlow` when available; CPU fallback otherwise).
+3. Estimates an affine transform via RANSAC, yielding per-frame
+   translation (px) and rotation (degrees).
+
+Phase 2's stability + frozen-segment check then slices the segment's range
+from the analyzer (no `cv2.VideoCapture.set()` seek, no re-decode) and
+combines per-second translation / rotation into a shakiness score using
+weighted components:
 
 | Component              | Weight | Normalisation                     |
 | ---------------------- | ------ | --------------------------------- |
@@ -37,25 +86,18 @@ using weighted components:
 All component scores are clamped to [0, 1]; the weighted sum produces a
 per-second score in [0, 1].
 
-**Stage 2 (deep analysis):** Seconds whose Stage-1 score exceeds
-`deep_score_threshold` (default 0.25) are re-analysed at full resolution
-with every frame (no skip). The deep score replaces the fast score for
-those seconds.
+**Final verdict:** The overall score is the mean of all per-second scores.
+The segment passes if overall score <= `shaky_score_threshold` (default 0.50).
 
-**Final verdict:** The overall score is the mean of all per-second scores
-(deep where available, fast otherwise). The video passes if overall score
-<= `shaky_score_threshold` (default 0.30).
+CUDA GPU acceleration is used automatically when OpenCV is built with CUDA
+support (`cv2.cuda.SparsePyrLKOpticalFlow`), with transparent CPU fallback.
 
-Translation and rotation thresholds are expressed in native-resolution
-pixels/frame; Stage-1 values are automatically scaled back to native
-equivalents before scoring.
-
-## Luminance & Blur
+### Luminance & Blur
 
 Per-frame classification using the decision table below, followed by segment-level
 aggregation. Two acceptance conditions must both pass:
 
-1. (accept + review) frames >= 80% of total frames
+1. (accept + review) frames >= 70% of total frames
 2. Brightness stability: std dev of per-frame mean luminance <= 60
 
 | Condition              | Mean Luminance | Normalized Tenengrad | Raw Tenengrad | Decision |
@@ -79,23 +121,19 @@ Normalized = raw / (mean_luminance^2 + epsilon). In the low-light noise zone
 (luminance 40-70), normalized Tenengrad is unreliable due to noise amplification,
 so raw Tenengrad is used instead.
 
-**Segment analysis:** Frames are classified per the table above, then collapsed
-into contiguous good/bad segments. "Review" frames count as good for segmentation.
-The video passes if the ratio of good frames (accept + review) to total frames
-meets the 80% threshold.
+### Face Presence (strict)
 
-## ML Detection
+Rejects any segment whose sampled frames contain even a single face detected
+at or above `face_confidence_threshold` (0.80). This is stricter than the
+Phase 1 face-presence gate — Phase 1 discards only contiguous bad runs longer
+than `--min-bad-segment` seconds (default 2s), so brief flashes of a face can
+survive into checkable segments. Phase 2 face presence re-checks with zero
+tolerance.
 
-| Check                   | Acceptance Condition                                                                          | How It Is Estimated                             |
-| ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| Face Presence           | Face detection confidence < 0.8 in all frames                                                 | Per-frame face detection                        |
-| Participants            | Persons detected <= 1 in >= 90% frames                                                        | Person detection                                |
-| Hand Visibility         | >= 90% frames with both hands fully in frame (bbox > 2 px from every edge, confidence >= 0.7) | Per-frame hands detection + bbox edge clearance |
-| Hand-Object Interaction | Interaction detected in >= 70% frames                                                         | Hand + object proximity analysis                |
-| View Obstruction        | <= 10% frames obstructed                                                                      | Occlusion detection                             |
-| Body Part Visibility    | Only hands/forearms (up to elbows) visible in >= 90% frames                                   | YOLO11m-pose keypoint detection                 |
-| POV-Hand Angle          | Hand angle from frame center < 40° in >= 80% frames                                           | Hand bbox center vs frame center                |
-| Privacy Safety          | Sensitive object detections = 0 in all frames                                                 | Grounding DINO zero-shot detection              |
+Reuses SCRFD detections cached from Phase 1 — no extra inference. The metric
+reported is the fraction of frames with **no** prominent face (higher is
+better, 1.0 = clean). Details include `frames_with_prominent_face`,
+`total_frames`, and `max_face_confidence_seen`.
 
 ### POV-Hand Angle
 
@@ -107,62 +145,116 @@ normalized distance is mapped to an angle using an assumed diagonal FOV of 90°:
     angle = (pixel_dist / half_diagonal) * (diagonal_fov / 2)
 
 A frame passes if ALL detected hands have angle < 40°. Frames with no hands
-detected count as failures. The video passes if >= 80% of frames pass.
+detected count as failures. The segment passes if >= 60% of frames pass.
 
-### Privacy Safety — Grounding DINO Detection
+## Phase 3: Yield Calculation
 
-Every sampled frame is analysed using Grounding DINO zero-shot object detection
-with the text prompt:
+| Metric             | Definition                                                                                         |
+| ------------------ | -------------------------------------------------------------------------------------------------- |
+| Usable footage     | Sum of durations of all segments that passed Phase 2                                                |
+| Unusable footage   | Phase 1 bad segments + Phase 1 discarded short segments (< min duration) + Phase 2 rejected segments |
+| Yield              | Usable footage / original video duration                                                            |
 
-    "laptop screen . computer monitor . smartphone screen .
-     paper document . credit card . ID card . identification card . bank card"
+**Invariant:** Original duration = usable footage + unusable footage.
 
-Grounding DINO thresholds: box_threshold=0.3, text_threshold=0.25. The video
-passes only if zero frames contain a detection above threshold (zero tolerance).
+## Output
 
-When sensitive objects are detected, the check reports the exact timestamps
-(HH:MM:SS) and object labels for every frame with a detection. This information
-is included in the `sensitive_timestamps` field of the check result details and
-logged to stdout during the pipeline run.
+The pipeline produces timestamps and reports only — no clip files are cut
+from the source video. Each range of the source is categorized as one of:
+
+| Category       | Meaning                                                                        |
+| -------------- | ------------------------------------------------------------------------------ |
+| **USABLE**     | Passed both Phase 1 filtering and all enabled Phase 2 validation checks.        |
+| **UNUSABLE**   | Filtered in Phase 1 (face / participants / privacy), or a clean gap too short to validate (`segment_too_short`). |
+| **REJECTED**   | Checkable segment that ran through Phase 2 but failed one or more validation checks. Also: the single span of a video rejected at the Phase 0 metadata gate. |
+
+### Per Video
+
+- **`report.md`** — A markdown report whose core artifact is a unified
+  chronological timeline in `HH:MM:SS.mmm` format. Every row is one
+  contiguous range of the source video, labeled with its category and,
+  for non-USABLE ranges, the failing check names plus the observed
+  metric vs. the accepted threshold (e.g., `ml_hand_visibility (accepted
+  both>=80% OR single>=90%; observed both=42%, single=58%)`). Includes
+  the Phase 0 metadata table. For metadata-fail videos the timeline
+  collapses to a single REJECTED row covering the whole video.
+- **`{video_name}.json`** — Machine-readable dump of the complete
+  `VideoProcessingResult` dataclass: all segments, per-check results,
+  metadata, and timings.
+
+### Per Batch
+
+- **`batch_report.md`** — Topline stats: total yield, total usable / unusable durations, per-video summary table.
+- **`batch_results.json`** — Machine-readable batch results.
+
+### Output Directory Structure
+
+```
+results/run_NNN/
+├── {video_name}/
+│   ├── report.md
+│   └── {video_name}.json
+├── batch_report.md
+└── batch_results.json
+```
 
 ## Performance Optimizations
+
+### Video Decode
+
+- **Single-pass decode:** Frame extraction and Phase 2 motion analysis
+  share one pass over the video. `frame_extractor.extract_frames` tees
+  the native-rate stream into a `MotionAnalyzer` (LK accumulator);
+  Phase 2's stability + frozen-segment check slices the pre-computed
+  per-second data without re-decoding.
+- **NVDEC hardware decode:** When the cv2 build has `cudacodec`,
+  `extract_frames` uses `cv2.cudacodec.VideoReader` for GPU-side H.264
+  decode. Frames are downloaded to CPU (BGR numpy) only at sample /
+  motion points. Falls back to `cv2.VideoCapture` when cudacodec is
+  absent. Output frames are identical in both paths.
+
+### Phase 1
+
+- **No early stopping:** All frames are scanned to identify segment boundaries.
+- **720p long-edge downscale:** Each sampled frame is resized once at
+  the top of Phase 1 (`PipelineConfig.phase1_long_edge`, default 720).
+  YOLO / SCRFD / Hands23 all see the downscaled frames; bounding boxes
+  returned are in 720p coordinates and the Phase 2 segment dims are set
+  accordingly. Also caps the raw-frame cache held between Phase 1 and
+  Phase 2.
+- **Threaded SCRFD:** Face detection is dispatched across the batch via
+  a `ThreadPoolExecutor` (`PipelineConfig.scrfd_threads`, default 4),
+  overlapping with YOLO and Hands23 in the inner loop.
+- **Model pre-warm + cuDNN HEURISTIC:** `load_models()` runs one
+  synthetic-frame forward pass per model; SCRFD uses
+  `cudnn_conv_algo_search=HEURISTIC` to skip ORT's multi-second
+  EXHAUSTIVE autotune on first inference.
+- **Batched YOLO inference:** Object detection processes 16 frames per batch.
+
+### Phase 2
+
+- **Motion results derived, not recomputed:** Camera stability and
+  frozen-segment checks slice the per-second data from the
+  `MotionAnalyzer` populated during extraction. No per-segment
+  `cv2.VideoCapture` re-open, no redundant decode, no LK re-compute.
+- **Cached detections reused:** Hand / face detections from Phase 1 are
+  sliced by segment range; no extra ML inference runs in Phase 2.
+- **Segments processed sequentially:** GPU models are shared; sequential processing avoids GPU contention.
 
 ### Hands23 Input Downscaling
 
 The Hands23 detector (Faster R-CNN X-101-FPN) is the most compute-intensive model
-in the pipeline. To reduce inference time, frames are downscaled before being fed
-to the model. The long edge of the frame is capped at `hands23_max_resolution`
-(default 720), preserving aspect ratio. Output bounding box coordinates are
-automatically scaled back to the original frame dimensions so downstream checks
-are unaffected.
+in the pipeline. Frames are downscaled before inference — long edge capped at
+`hands23_max_resolution` (default 720), preserving aspect ratio. Output bounding box
+coordinates are automatically scaled back to original dimensions.
 
-| Parameter                | Default | Effect                                          |
-| ------------------------ | ------- | ----------------------------------------------- |
-| `hands23_max_resolution` | 720     | Cap long edge to 720px (1920×1080 → 1280×720)   |
-| `hands23_max_resolution` | `None`  | Disable downscaling, run at native resolution   |
+Redundant with the Phase 1 720p downscale above, but kept as a safety net
+in case a caller sets `phase1_long_edge=None` (native resolution).
 
-Downscaling uses `cv2.INTER_AREA` (pixel-area averaging), which is the
-recommended interpolation method for reduction as it avoids aliasing artifacts.
+### Camera Stability FPS Cap
 
-In egocentric video, hands are typically large in-frame (300-500px at 1080p,
-200-330px at 720p), well above the model's minimum effective anchor size (~32px).
-Impact on hand detection, contact state classification, and left/right
-classification is negligible at 720p.
+Caps optical flow analysis at 30 FPS regardless of native frame rate.
 
-## Pipeline Behavior
+### Frozen Segment Subsampling
 
-- **Metadata gate:** If any video metadata check fails, all other checks are skipped.
-- **Independent categories:** Luminance & blur, motion analysis, and ML detection run
-  independently -- a failure in one does not skip others (unless `fail_fast` is enabled,
-  in which case a luminance failure skips motion + ML, and a motion failure skips ML).
-- **Parallel execution:** When `fail_fast` is disabled (default), motion analysis runs in
-  a background thread concurrently with ML detection.
-- **Early stopping:** During ML inference, an `EarlyStopMonitor` tracks per-check outcomes
-  frame by frame. Zero-tolerance checks (face presence) fail immediately on
-  the first failing frame. Privacy safety is excluded from early stopping so that
-  all frames are scanned and every sensitive-object timestamp is collected.
-  Threshold-based checks (hand visibility, participants, interaction,
-  POV-hand angle, body part visibility) are marked pass once they have accumulated enough
-  passing frames, or fail once the required pass rate becomes mathematically unreachable.
-  When all check outcomes are determined, the inference loop terminates early.
-- **Statuses:** pass, fail, review (for borderline results), skipped (metadata gate).
+Samples at 10 FPS instead of native FPS for frozen detection.

@@ -1,70 +1,64 @@
-"""Unified video validation pipeline.
+"""Validation & Processing Pipeline.
 
-Runs all checks in order:
-  1. Video metadata (short-circuits on failure)
-  2. Luminance & blur (includes brightness stability)
-  3. Motion analysis
-  4. ML detection (SCRFD, YOLO11m, YOLO11m-pose, Hands23, Grounding DINO)
+4-phase pipeline that classifies time ranges in egocentric videos:
+  Phase 0: Metadata gate (short-circuits on failure)
+  Phase 1: Segment filtering (face, participants) — no early stopping
+  Phase 2: Segment validation (luminance, motion, hand + face ML checks)
+  Phase 3: Yield calculation
 
-Results are keyed by category: meta_*, luminance_blur,
-motion_*, ml_*.
+Results include per-frame labels, segment timestamps, usable/rejected
+segments, and yield metrics. No clip files are produced.
 """
 
-import os
-import sys
 import time
+import cv2
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 from bachman_cortex.checks.check_results import CheckResult
+from bachman_cortex.data_types import (
+    TimeSegment,
+    FrameLabel,
+    CheckFrameResults,
+    CheckableSegment,
+    SegmentValidationResult,
+    VideoProcessingResult,
+)
 from bachman_cortex.utils.video_metadata import get_video_metadata
 from bachman_cortex.checks.video_metadata import run_all_metadata_checks
 from bachman_cortex.checks.luminance_blur import check_luminance_blur, LuminanceBlurConfig
-from bachman_cortex.checks.motion_analysis import check_camera_stability, check_frozen_segments
-from bachman_cortex.checks.face_presence import check_face_presence
-from bachman_cortex.checks.participants import check_participants
+from bachman_cortex.checks.motion_analysis import (
+    MotionAnalyzer,
+    check_motion_combined_from_analyzer,
+)
 from bachman_cortex.checks.hand_visibility import check_hand_visibility
 from bachman_cortex.checks.hand_object_interaction import check_hand_object_interaction
-from bachman_cortex.checks.privacy_safety import check_privacy_safety
 from bachman_cortex.checks.view_obstruction import check_view_obstruction
 from bachman_cortex.checks.pov_hand_angle import check_pov_hand_angle
-from bachman_cortex.checks.body_part_visibility import check_body_part_visibility
+from bachman_cortex.checks.face_presence import check_face_presence
 from bachman_cortex.utils.frame_extractor import extract_frames
+from bachman_cortex.utils.transcode import maybe_transcode_hevc_to_h264
+from bachman_cortex.utils.segment_ops import (
+    per_frame_to_bad_segments,
+    filter_short_bad_segments,
+    merge_bad_segments,
+    compute_good_segments,
+    filter_checkable_segments,
+)
 from bachman_cortex.utils.early_stop import (
-    EarlyStopMonitor,
-    CheckSpec,
-    eval_hand_visibility,
     eval_face_presence,
     eval_participants,
-    eval_hand_object_interaction,
-    eval_pov_hand_angle,
-    eval_body_part_visibility,
 )
 
 # Batch size for YOLO inference in the ML loop
 _BATCH_SIZE = 16
 
-# All non-metadata check keys, used for skipped results on metadata failure
-NON_META_CHECK_KEYS = [
-    "luminance_blur",
-    "motion_camera_stability",
-    "motion_frozen_segments",
-    "ml_face_presence",
-    "ml_participants",
-    "ml_hand_visibility",
-    "ml_hand_object_interaction",
-    "ml_privacy_safety",
-    "ml_view_obstruction",
-    "ml_pov_hand_angle",
-    "ml_body_part_visibility",
-]
-
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the full validation pipeline."""
+    """Configuration for the validation & processing pipeline."""
     # Frame sampling
     sampling_fps: float = 1.0
     max_frames: int | None = None
@@ -72,41 +66,33 @@ class PipelineConfig:
     # Model paths
     scrfd_root: str = "bachman_cortex/models/weights/insightface"
     yolo_model: str = "yolo11s.pt"
-    yolo_pose_model: str = "yolo11m-pose.pt"
     hand_detector_repo: str = "bachman_cortex/models/weights/hands23_detector"
-    gdino_cache: str = "bachman_cortex/models/weights/grounding_dino"
 
     # ML thresholds
     face_confidence_threshold: float = 0.8
     person_confidence_threshold: float = 0.4
     hand_confidence_threshold: float = 0.7
-    hand_pass_rate: float = 0.90
-    interaction_pass_rate: float = 0.70
+    hand_pass_rate: float = 0.80  # both-hands fraction threshold
+    single_hand_pass_rate: float = 0.90  # fallback: at-least-one-hand fraction
+    interaction_pass_rate: float = 0.60
     participant_pass_rate: float = 0.90
-    privacy_gdino_threshold: float = 0.3
+    participant_face_threshold: float = 0.5
+    participant_min_height_ratio: float = 0.15
     obstruction_max_ratio: float = 0.10
     angle_threshold: float = 40.0
-    angle_pass_rate: float = 0.80
+    angle_pass_rate: float = 0.60
     diagonal_fov_degrees: float = 90.0
-    body_part_pass_rate: float = 0.90
-    body_part_keypoint_conf: float = 0.5
-    hand_frame_margin: int = 2
+    hand_frame_margin: int = 0
 
-    # Grounding DINO
-    run_grounding_dino: bool = True
-    gdino_text_prompt: str = (
-        "laptop screen . computer monitor . smartphone screen . "
-        "paper document . credit card . ID card . identification card . bank card"
-    )
+    # Opt-in preprocessing: lossless HEVC → H.264 conversion before Phase 0.
+    transcode_hevc: bool = False
 
     # Brightness stability threshold
     max_brightness_std: float = 60.0
 
-    # Camera stability (two-stage LK optical flow)
-    shaky_score_threshold: float = 0.30
-    deep_score_threshold: float = 0.25
-    fast_scale: float = 0.333
-    frame_skip: int = 2
+    # Camera stability (single-pass LK optical flow at 0.5x)
+    shaky_score_threshold: float = 0.50
+    fast_scale: float = 0.5
     stability_trans_threshold: float = 8.0
     stability_jump_threshold: float = 30.0
     stability_rot_threshold: float = 0.3
@@ -122,22 +108,31 @@ class PipelineConfig:
 
     # Frozen segments
     frozen_max_consecutive: int = 30
-    frozen_ssim_threshold: float = 0.99
-    frozen_target_fps: float = 10.0
+    frozen_trans_threshold: float = 0.1
+    frozen_rot_threshold: float = 0.001
 
     # Luminance & blur
-    luminance_blur_min_good_ratio: float = 0.80
+    luminance_blur_min_good_ratio: float = 0.70
 
-    # Hands23 input resolution cap (downscale long edge to this before inference).
-    # Set to None to disable and run at native resolution.
+    # Hands23 input resolution cap
     hands23_max_resolution: int | None = 720
 
-    # Fail-fast: skip ML inference when quality checks fail
-    fail_fast: bool = False
+    # Phase 1 frame downscale (long-edge). None disables downscaling.
+    # Feeds YOLO / SCRFD / Hands23 with ~2.3x fewer pixels at 720p.
+    phase1_long_edge: int | None = 720
+
+    # Thread-pool workers for SCRFD face detection within a batch.
+    # InsightFace's FaceAnalysis.get() isn't batch-capable; overlap across
+    # frames via a small thread pool.
+    scrfd_threads: int = 4
+
+    # Segment filtering
+    min_checkable_segment_sec: float = 60.0
+    min_bad_segment_sec: float = 2.0
 
 
-class ValidationPipeline:
-    """Unified pipeline that runs metadata, quality, motion, and ML checks."""
+class ValidationProcessingPipeline:
+    """4-phase pipeline: metadata gate, segment filtering, segment validation, yield."""
 
     def __init__(self, config: PipelineConfig | None = None):
         self.config = config or PipelineConfig()
@@ -148,22 +143,14 @@ class ValidationPipeline:
         print("Loading ML models...")
         t0 = time.perf_counter()
 
-        # 1. SCRFD face detector
         from bachman_cortex.models.scrfd_detector import SCRFDDetector
         self.face_detector = SCRFDDetector(root=self.config.scrfd_root)
         print("  SCRFD loaded")
 
-        # 2. YOLO11m
         from bachman_cortex.models.yolo_detector import YOLODetector
         self.yolo_detector = YOLODetector(model_path=self.config.yolo_model)
-        print("  YOLO11m loaded")
+        print(f"  YOLO loaded ({self.config.yolo_model})")
 
-        # 3. YOLO11m-pose
-        from bachman_cortex.models.yolo_pose_detector import YOLOPoseDetector
-        self.pose_detector = YOLOPoseDetector(model_path=self.config.yolo_pose_model)
-        print("  YOLO11m-pose loaded")
-
-        # 4. Hands23 hand-object detector
         from bachman_cortex.models.hand_detector import HandObjectDetectorHands23
         self.hand_detector = HandObjectDetectorHands23(
             repo_dir=self.config.hand_detector_repo,
@@ -171,104 +158,479 @@ class ValidationPipeline:
         )
         print("  Hands23 loaded")
 
-        # 5. Grounding DINO (optional, for privacy)
-        self.gdino_detector = None
-        if self.config.run_grounding_dino:
-            from bachman_cortex.models.grounding_dino_detector import GroundingDINODetector
-            self.gdino_detector = GroundingDINODetector(
-                cache_dir=self.config.gdino_cache,
-            )
-            print("  Grounding DINO loaded")
+        # Pre-warm all models with a synthetic forward pass so the first
+        # real inference doesn't pay ORT autotune / lazy CUDA init cost.
+        self._warmup_models()
 
         elapsed = time.perf_counter() - t0
         print(f"All models loaded in {elapsed:.1f}s")
         self._models_loaded = True
 
-    def process_video(self, video_path: str | Path) -> dict[str, CheckResult]:
-        """Run all validation checks on a video.
+    def _warmup_models(self) -> None:
+        """Run one synthetic-frame forward pass through each loaded model."""
+        warm_h, warm_w = 720, 1280
+        dummy = np.zeros((warm_h, warm_w, 3), dtype=np.uint8)
+        t0 = time.perf_counter()
+        try:
+            self.face_detector.detect(dummy)
+        except Exception as e:
+            print(f"  warmup SCRFD failed: {e}")
+        try:
+            self.yolo_detector.detect_batch([dummy])
+        except Exception as e:
+            print(f"  warmup YOLO failed: {e}")
+        try:
+            self.hand_detector.detect(dummy)
+        except Exception as e:
+            print(f"  warmup Hands23 failed: {e}")
+        print(f"  models warmed in {time.perf_counter() - t0:.1f}s")
+
+    # ── Main entry point ─────────────────────────────────────────────────
+
+    def process_video(
+        self, video_path: str | Path, output_dir: str | Path,
+    ) -> VideoProcessingResult:
+        """Run the full 4-phase pipeline on a video.
+
+        Args:
+            video_path: Path to input video.
+            output_dir: Per-video output directory for report + JSON.
 
         Returns:
-            Dict mapping check name to CheckResult.
-            Keys are prefixed by category: meta_*, quality_*, luminance_blur,
-            motion_*, ml_*.
+            VideoProcessingResult with all phases' data.
         """
         video_path = str(video_path)
-        results = {}
-        timings = {}
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        video_name = Path(video_path).stem
+        t_start = time.perf_counter()
 
-        # ── Step 1: Metadata checks (short-circuit gate) ──────────
+        # ── Pre-Phase 0: Optional HEVC → H.264 lossless transcode ────
+        transcode_info: dict | None = None
+        active_path = video_path
+        if self.config.transcode_hevc:
+            preprocessed_dir = output_dir.parent / "_preprocessed"
+            active_path, transcode_info = maybe_transcode_hevc_to_h264(
+                video_path, preprocessed_dir,
+            )
+
+        # ── Phase 0: Metadata ────────────────────────────────────────
+        print("\n--- Phase 0: Metadata checks ---")
+        meta_passed, metadata, meta_results = self._phase0_metadata(active_path)
+        original_duration = metadata.get("duration_s", 0.0)
+
+        if not meta_passed:
+            print("  Metadata FAILED — rejecting entire video")
+            return VideoProcessingResult(
+                video_path=video_path,
+                video_name=video_name,
+                original_duration_sec=original_duration,
+                metadata=metadata,
+                metadata_passed=False,
+                metadata_results=meta_results,
+                phase1_check_frame_results=[],
+                phase1_bad_segments=[],
+                phase1_discarded_segments=[],
+                prefiltered_segments=[],
+                segment_results=[],
+                usable_segments=[],
+                rejected_segments=[],
+                usable_duration_sec=0.0,
+                unusable_duration_sec=original_duration,
+                yield_ratio=0.0,
+                processing_time_sec=round(time.perf_counter() - t_start, 2),
+                transcode_info=transcode_info,
+            )
+
+        # ── Extract frames for Phase 1 (tee native stream to motion) ─
         t0 = time.perf_counter()
-        metadata = get_video_metadata(video_path)
-        meta_results = run_all_metadata_checks(metadata)
-        timings["metadata"] = time.perf_counter() - t0
-        results.update(meta_results)
+        probe_cap = cv2.VideoCapture(active_path)
+        probe_fps = probe_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        probe_total = int(probe_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        probe_cap.release()
 
-        print(f"Metadata checks ({timings['metadata']:.2f}s):")
-        for name, r in meta_results.items():
-            print(f"  {name:<25} {r.status:>4}")
+        motion_analyzer = MotionAnalyzer(
+            native_fps=probe_fps,
+            total_frames=probe_total,
+            fast_scale=self.config.fast_scale,
+            target_fps=self.config.stability_target_fps,
+            max_corners=self.config.stability_max_corners,
+            lk_win_size=self.config.stability_lk_win_size,
+            lk_max_level=self.config.stability_lk_max_level,
+        )
 
-        # If any metadata check fails, skip all other checks
-        meta_failed = any(r.status == "fail" for r in meta_results.values())
-        if meta_failed:
-            print("  Metadata check FAILED -- skipping all other checks")
-            for key in NON_META_CHECK_KEYS:
-                results[key] = CheckResult(
-                    status="skipped",
-                    metric_value=0.0,
-                    confidence=1.0,
-                    details={"reason": "metadata check failed"},
-                )
-            return results
-
-        # ── Step 2: Extract sampled frames ────────────────────────
-        t0 = time.perf_counter()
         frames, frame_meta = extract_frames(
-            video_path,
+            active_path,
             fps=self.config.sampling_fps,
             max_frames=self.config.max_frames,
+            motion_analyzer=motion_analyzer,
         )
-        timings["frame_extraction"] = time.perf_counter() - t0
         frame_h, frame_w = frame_meta["height"], frame_meta["width"]
-
-        # Compute per-frame timestamps in seconds (for privacy timestamp reporting)
-        frame_timestamps_sec = [i / self.config.sampling_fps for i in range(len(frames))]
-
         print(f"Extracted {len(frames)} frames ({frame_meta['duration_s']}s video) "
-              f"in {timings['frame_extraction']:.2f}s")
+              f"in {time.perf_counter() - t0:.2f}s "
+              f"[motion: {motion_analyzer.frames_processed} samples]")
 
-        # ── Step 3: Luminance & blur ──────────────────────────────
-        t0 = time.perf_counter()
-        lb_config = LuminanceBlurConfig(
-            min_good_ratio=self.config.luminance_blur_min_good_ratio,
-            max_brightness_std=self.config.max_brightness_std,
+        # ── Phase 1: Segment filtering ───────────────────────────────
+        print("\n--- Phase 1: Segment filtering (face, participants) ---")
+        (
+            phase1_check_results,
+            bad_segments,
+            discarded_segments,
+            prefiltered_segments,
+            phase1_cache,
+        ) = self._phase1_segment_filter(active_path, frames, frame_meta)
+        phase1_cache['motion_analyzer'] = motion_analyzer
+
+        if not prefiltered_segments:
+            print("  No checkable segments remain — rejecting entire video")
+            return VideoProcessingResult(
+                video_path=video_path,
+                video_name=video_name,
+                original_duration_sec=original_duration,
+                metadata=metadata,
+                metadata_passed=True,
+                metadata_results=meta_results,
+                phase1_check_frame_results=phase1_check_results,
+                phase1_bad_segments=bad_segments,
+                phase1_discarded_segments=discarded_segments,
+                prefiltered_segments=[],
+                segment_results=[],
+                usable_segments=[],
+                rejected_segments=[],
+                usable_duration_sec=0.0,
+                unusable_duration_sec=original_duration,
+                yield_ratio=0.0,
+                processing_time_sec=round(time.perf_counter() - t_start, 2),
+                transcode_info=transcode_info,
+            )
+
+        print(f"  {len(prefiltered_segments)} pre-filtered segment(s):")
+        for seg in prefiltered_segments:
+            print(f"    Segment {seg.segment_idx}: {seg.start_sec:.1f}s - {seg.end_sec:.1f}s "
+                  f"({seg.duration:.1f}s)")
+
+        # ── Phase 2: Segment validation ──────────────────────────────
+        print("\n--- Phase 2: Segment validation ---")
+        segment_results = self._phase2_segment_validation(
+            active_path, prefiltered_segments, frame_meta, phase1_cache,
         )
-        results["luminance_blur"] = check_luminance_blur(frames, config=lb_config)
-        timings["luminance_blur"] = time.perf_counter() - t0
-        print(f"Luminance & blur check ({timings['luminance_blur']:.2f}s)")
+        del phase1_cache, frames  # free Phase 1 frames
 
-        # ── Fail-fast gate on luminance ─────────────────────────
-        if self.config.fail_fast and results["luminance_blur"].status == "fail":
-            print("  Fail-fast: skipping motion + ML (luminance_blur failed)")
-            for key in [k for k in NON_META_CHECK_KEYS if k != "luminance_blur"]:
-                results[key] = CheckResult(
-                    status="skipped", metric_value=0.0, confidence=1.0,
-                    details={"reason": "fail-fast: luminance_blur failed"},
+        usable_segments = [sr.segment for sr in segment_results if sr.passed]
+        rejected_segments = [sr.segment for sr in segment_results if not sr.passed]
+
+        for sr in segment_results:
+            status = "PASS" if sr.passed else "FAIL"
+            print(f"  Segment {sr.segment.segment_idx}: {status}")
+            if sr.failing_checks:
+                print(f"    Failing: {', '.join(sr.failing_checks)}")
+
+        # ── Phase 3: Yield calculation ───────────────────────────────
+        print("\n--- Phase 3: Yield calculation ---")
+        usable_dur, unusable_dur, yield_ratio = self._phase3_yield(
+            original_duration, segment_results,
+        )
+        print(f"  Usable:   {usable_dur:.1f}s")
+        print(f"  Unusable: {unusable_dur:.1f}s")
+        print(f"  Yield:    {yield_ratio:.1%}")
+
+        processing_time = round(time.perf_counter() - t_start, 2)
+        print(f"\nTotal processing time: {processing_time:.1f}s")
+
+        return VideoProcessingResult(
+            video_path=video_path,
+            video_name=video_name,
+            original_duration_sec=original_duration,
+            metadata=metadata,
+            metadata_passed=True,
+            metadata_results=meta_results,
+            phase1_check_frame_results=phase1_check_results,
+            phase1_bad_segments=bad_segments,
+            phase1_discarded_segments=discarded_segments,
+            prefiltered_segments=prefiltered_segments,
+            segment_results=segment_results,
+            usable_segments=usable_segments,
+            rejected_segments=rejected_segments,
+            usable_duration_sec=usable_dur,
+            unusable_duration_sec=unusable_dur,
+            yield_ratio=yield_ratio,
+            processing_time_sec=processing_time,
+            transcode_info=transcode_info,
+        )
+
+    # ── Phase 0 ──────────────────────────────────────────────────────
+
+    def _phase0_metadata(
+        self, video_path: str,
+    ) -> tuple[bool, dict, dict[str, CheckResult]]:
+        """Run metadata checks. Returns (passed, metadata, results)."""
+        metadata = get_video_metadata(video_path)
+        results = run_all_metadata_checks(metadata)
+
+        for name, r in results.items():
+            print(f"  {name:<25} {r.status:>4}")
+
+        passed = all(r.status != "fail" for r in results.values())
+        return passed, metadata, results
+
+    # ── Phase 1 ──────────────────────────────────────────────────────
+
+    def _phase1_segment_filter(
+        self,
+        video_path: str,
+        frames: list[np.ndarray],
+        frame_meta: dict,
+    ) -> tuple[
+        list[CheckFrameResults],
+        list[TimeSegment],
+        list[TimeSegment],
+        list[CheckableSegment],
+        dict,
+    ]:
+        """Run Phase 1 checks on ALL frames, compute segments.
+
+        Returns:
+            (check_frame_results, unified_bad_segments,
+             discarded_segments, prefiltered_segments, phase1_cache)
+        """
+        if not self._models_loaded:
+            self.load_models()
+
+        total_frames = len(frames)
+        frame_timestamps = [i / self.config.sampling_fps for i in range(total_frames)]
+
+        return self._phase1_run_inference(
+            video_path, frames, frame_meta, total_frames, frame_timestamps,
+        )
+
+    def _phase1_run_inference(
+        self,
+        video_path: str,
+        frames: list[np.ndarray],
+        frame_meta: dict,
+        total_frames: int,
+        frame_timestamps: list[float],
+    ) -> tuple[
+        list[CheckFrameResults],
+        list[TimeSegment],
+        list[TimeSegment],
+        list[CheckableSegment],
+        dict,
+    ]:
+        native_w, native_h = frame_meta["width"], frame_meta["height"]
+        original_duration = frame_meta["duration_s"]
+
+        # Downscale frames once to a shared 720p long-edge target. Feeds
+        # YOLO, SCRFD, and Hands23 with ~2.3x fewer pixels than native 1080p
+        # and drops the Phase 1 raw-frame cache size proportionally
+        # (P1.1 + P1.2).
+        target_long = self.config.phase1_long_edge
+        if target_long and max(native_h, native_w) > target_long:
+            scale = target_long / max(native_h, native_w)
+            new_w = int(round(native_w * scale))
+            new_h = int(round(native_h * scale))
+            frames = [
+                cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                for f in frames
+            ]
+            frame_w, frame_h = new_w, new_h
+        else:
+            frame_w, frame_h = native_w, native_h
+
+        per_frame_faces = []
+        per_frame_yolo_persons = []
+        per_frame_hands = []
+
+        t0 = time.perf_counter()
+
+        scrfd_pool = ThreadPoolExecutor(max_workers=self.config.scrfd_threads)
+        try:
+            for batch_start in range(0, total_frames, _BATCH_SIZE):
+                batch_end = min(batch_start + _BATCH_SIZE, total_frames)
+                batch_frames = frames[batch_start:batch_end]
+
+                batch_yolo = self.yolo_detector.detect_batch(batch_frames)
+                face_futures = [
+                    scrfd_pool.submit(self.face_detector.detect, bf)
+                    for bf in batch_frames
+                ]
+
+                for j, frame in enumerate(batch_frames):
+                    faces = face_futures[j].result()
+                    per_frame_faces.append(faces)
+
+                    yolo_dets = batch_yolo[j]
+                    persons = self.yolo_detector.get_persons(yolo_dets)
+                    per_frame_yolo_persons.append(persons)
+
+                    hands, _ = self.hand_detector.detect(frame)
+                    per_frame_hands.append(hands)
+
+                    i = batch_start + j
+                    if (i + 1) % 50 == 0 or i + 1 == total_frames:
+                        print(f"  Phase 1 inference: {i + 1}/{total_frames} frames")
+        finally:
+            scrfd_pool.shutdown(wait=False)
+
+        # ── Step 2: Evaluate face/participant per frame ──────────────
+        face_labels: list[FrameLabel] = []
+        participant_labels: list[FrameLabel] = []
+
+        for i in range(total_frames):
+            ts = frame_timestamps[i]
+
+            face_passed = eval_face_presence(
+                per_frame_faces[i], self.config.face_confidence_threshold,
+            )
+            max_face_conf = max(
+                (f.confidence for f in per_frame_faces[i]), default=0.0,
+            )
+            face_labels.append(FrameLabel(
+                frame_idx=i,
+                timestamp_sec=ts,
+                passed=face_passed,
+                confidence=max_face_conf,
+                labels=[f"face:{f.confidence:.2f}" for f in per_frame_faces[i]
+                        if f.confidence >= self.config.face_confidence_threshold],
+            ))
+
+            participant_passed = eval_participants(
+                per_frame_yolo_persons[i],
+                per_frame_faces[i],
+                per_frame_hands[i],
+                frame_h, frame_w,
+                self.config.person_confidence_threshold,
+                self.config.participant_face_threshold,
+                self.config.participant_min_height_ratio,
+            )
+            participant_labels.append(FrameLabel(
+                frame_idx=i,
+                timestamp_sec=ts,
+                passed=participant_passed,
+                confidence=1.0 if participant_passed else 0.0,
+                labels=["other_person_detected"] if not participant_passed else None,
+            ))
+
+        t_inference = time.perf_counter() - t0
+        print(f"  Phase 1 inference complete in {t_inference:.1f}s")
+
+        # ── Step 3: Build per-check bad segments ─────────────────────
+        frame_interval = 1.0 / self.config.sampling_fps
+        min_bad = self.config.min_bad_segment_sec
+        face_bad_raw = per_frame_to_bad_segments(face_labels, frame_interval)
+        participant_bad_raw = per_frame_to_bad_segments(participant_labels, frame_interval)
+        face_bad = filter_short_bad_segments(face_bad_raw, min_bad)
+        participant_bad = filter_short_bad_segments(participant_bad_raw, min_bad)
+
+        check_frame_results = [
+            CheckFrameResults("ml_face_presence", face_labels, face_bad),
+            CheckFrameResults("ml_participants", participant_labels, participant_bad),
+        ]
+        segment_lists = [face_bad, participant_bad]
+
+        # Report per-check bad segments
+        for cfr in check_frame_results:
+            bad_dur = sum(s.duration for s in cfr.bad_segments)
+            print(f"  {cfr.check_name}: {len(cfr.bad_segments)} bad segment(s), "
+                  f"{bad_dur:.1f}s total")
+
+        # Merge bad segments across all checks, then filter short merged segments
+        unified_bad = merge_bad_segments(segment_lists)
+        unified_bad = filter_short_bad_segments(unified_bad, min_bad)
+        unified_bad_dur = sum(s.duration for s in unified_bad)
+        print(f"  Unified bad segments: {len(unified_bad)}, {unified_bad_dur:.1f}s total")
+
+        # Compute good segments and filter by minimum duration
+        good_segments = compute_good_segments(original_duration, unified_bad)
+        prefiltered_segments, discarded = filter_checkable_segments(
+            good_segments, self.config.min_checkable_segment_sec,
+        )
+
+        if discarded:
+            discarded_dur = sum(s.duration for s in discarded)
+            print(f"  Discarded {len(discarded)} segment(s) < "
+                  f"{self.config.min_checkable_segment_sec}s ({discarded_dur:.1f}s)")
+
+        phase1_cache = {
+            'frames': frames,
+            'frame_dims': (frame_h, frame_w),
+            'per_frame_hands': per_frame_hands,
+            'per_frame_faces': per_frame_faces,
+        }
+
+        return check_frame_results, unified_bad, discarded, prefiltered_segments, phase1_cache
+
+    # ── Phase 2 ──────────────────────────────────────────────────────
+
+    def _phase2_segment_validation(
+        self,
+        video_path: str,
+        segments: list[CheckableSegment],
+        frame_meta: dict,
+        phase1_cache: dict,
+    ) -> list[SegmentValidationResult]:
+        """Run remaining checks on each checkable segment sequentially."""
+        results = []
+        with ThreadPoolExecutor(max_workers=1) as motion_executor:
+            for seg in segments:
+                result = self._phase2_validate_single_segment(
+                    video_path, seg, frame_meta, phase1_cache, motion_executor,
                 )
-            return results
+                results.append(result)
+        return results
 
-        # ── Step 4+5: Motion analysis + ML inference ─────────────
-        # When fail-fast is on, run motion first so we can skip ML on failure.
-        # When fail-fast is off, run motion in a background thread while ML
-        # runs on the main thread (parallel execution).
+    def _phase2_validate_single_segment(
+        self,
+        video_path: str,
+        segment: CheckableSegment,
+        frame_meta: dict,
+        phase1_cache: dict,
+        motion_executor: ThreadPoolExecutor,
+    ) -> SegmentValidationResult:
+        """Validate a single checkable segment with all Phase 2 checks.
+
+        Reuses frames, hand, face, and person detections cached from Phase 1
+        to avoid redundant inference.
+        """
+        print(f"\n  Validating segment {segment.segment_idx} "
+              f"({segment.start_sec:.1f}s - {segment.end_sec:.1f}s, {segment.duration:.1f}s)")
+
+        check_results: dict[str, CheckResult] = {}
+
+        # Reuse frames and hand detections cached from Phase 1
+        start_idx = int(segment.start_sec * self.config.sampling_fps)
+        end_idx = int(segment.end_sec * self.config.sampling_fps)
+        seg_frames = phase1_cache['frames'][start_idx:end_idx]
+        per_frame_hands = phase1_cache['per_frame_hands'][start_idx:end_idx]
+        per_frame_faces = phase1_cache['per_frame_faces'][start_idx:end_idx]
+
+        # Bboxes in the phase1 cache are in Phase-1 coordinates (720p
+        # long-edge by default; see phase1_long_edge). Use those dims so
+        # the check functions' dim-relative thresholds match.
+        seg_h, seg_w = phase1_cache.get(
+            'frame_dims', (frame_meta["height"], frame_meta["width"])
+        )
+
+        print(f"    {len(seg_frames)} frames for segment (cached from Phase 1)")
+
+        if not seg_frames:
+            return SegmentValidationResult(
+                segment=segment, passed=False,
+                check_results={},
+                failing_checks=["no_frames_extracted"],
+            )
+
+        # Reuse the per-video MotionAnalyzer populated during single-pass
+        # decode (no per-segment re-open). The derivation is CPU-cheap; run it
+        # inline rather than on the background executor.
+        analyzer: MotionAnalyzer = phase1_cache['motion_analyzer']
 
         def _run_motion():
-            t_stab = time.perf_counter()
-            stability = check_camera_stability(
-                video_path,
+            return check_motion_combined_from_analyzer(
+                analyzer,
+                start_sec=segment.start_sec,
+                end_sec=segment.end_sec,
                 shaky_score_threshold=self.config.shaky_score_threshold,
-                deep_score_threshold=self.config.deep_score_threshold,
-                fast_scale=self.config.fast_scale,
-                frame_skip=self.config.frame_skip,
                 trans_threshold=self.config.stability_trans_threshold,
                 jump_threshold=self.config.stability_jump_threshold,
                 rot_threshold=self.config.stability_rot_threshold,
@@ -277,345 +639,119 @@ class ValidationPipeline:
                 w_var=self.config.stability_w_var,
                 w_rot=self.config.stability_w_rot,
                 w_jump=self.config.stability_w_jump,
-                max_corners=self.config.stability_max_corners,
-                lk_win_size=self.config.stability_lk_win_size,
-                lk_max_level=self.config.stability_lk_max_level,
-                target_fps=self.config.stability_target_fps,
-            )
-            t_stab = time.perf_counter() - t_stab
-            t_froz = time.perf_counter()
-            frozen = check_frozen_segments(
-                video_path,
-                max_consecutive=self.config.frozen_max_consecutive,
-                ssim_threshold=self.config.frozen_ssim_threshold,
-                target_fps=self.config.frozen_target_fps,
-            )
-            t_froz = time.perf_counter() - t_froz
-            return stability, frozen, t_stab, t_froz
-
-        if self.config.fail_fast:
-            # Sequential: run motion first, gate ML on result
-            stability_result, frozen_result, t_stab, t_froz = _run_motion()
-            results["motion_camera_stability"] = stability_result
-            results["motion_frozen_segments"] = frozen_result
-            timings["camera_stability"] = t_stab
-            timings["frozen_segments"] = t_froz
-            print(f"Motion analysis ({t_stab:.2f}s stability, {t_froz:.2f}s frozen)")
-
-            failed_motion = [
-                k for k in ["motion_camera_stability", "motion_frozen_segments"]
-                if results[k].status == "fail"
-            ]
-            if failed_motion:
-                print(f"  Fail-fast: skipping ML ({', '.join(failed_motion)} failed)")
-                ml_keys = [k for k in NON_META_CHECK_KEYS if k.startswith("ml_")]
-                for key in ml_keys:
-                    results[key] = CheckResult(
-                        status="skipped", metric_value=0.0, confidence=1.0,
-                        details={"reason": f"fail-fast: {', '.join(failed_motion)} failed"},
-                    )
-                return results
-            motion_future = None
-        else:
-            # Parallel: launch motion in background thread
-            motion_executor = ThreadPoolExecutor(max_workers=1)
-            motion_future = motion_executor.submit(_run_motion)
-
-        # ML inference runs in the main thread
-        if not self._models_loaded:
-            self.load_models()
-
-        per_frame_faces = []
-        per_frame_yolo = []
-        per_frame_yolo_persons = []
-        per_frame_hands = []
-        per_frame_objects = []
-        per_frame_poses = []
-
-        t_scrfd = 0.0
-        t_yolo = 0.0
-        t_pose = 0.0
-        t_hands23 = 0.0
-
-        # Early stopping monitor
-        monitor = EarlyStopMonitor(len(frames), [
-            CheckSpec("hand_visibility", self.config.hand_pass_rate, False),
-            CheckSpec("face_presence", 1.0, True),
-            CheckSpec("participants", self.config.participant_pass_rate, False),
-            CheckSpec("hand_object_interaction", self.config.interaction_pass_rate, False),
-            CheckSpec("pov_hand_angle", self.config.angle_pass_rate, False),
-            CheckSpec("body_part_visibility", self.config.body_part_pass_rate, False),
-        ])
-
-        total_frames = len(frames)
-        frames_inferred = 0
-
-        for batch_start in range(0, total_frames, _BATCH_SIZE):
-            if monitor.all_determined():
-                break
-
-            batch_end = min(batch_start + _BATCH_SIZE, total_frames)
-            batch_frames = frames[batch_start:batch_end]
-
-            # Batched YOLO inference
-            t0 = time.perf_counter()
-            batch_yolo = self.yolo_detector.detect_batch(batch_frames)
-            t_yolo += time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            batch_poses = self.pose_detector.detect_batch(batch_frames)
-            t_pose += time.perf_counter() - t0
-
-            # Per-frame inference for SCRFD + Hands23 (no batch API)
-            for j, frame in enumerate(batch_frames):
-                i = batch_start + j  # global frame index
-
-                t0 = time.perf_counter()
-                faces = self.face_detector.detect(frame)
-                t_scrfd += time.perf_counter() - t0
-                per_frame_faces.append(faces)
-
-                yolo_dets = batch_yolo[j]
-                per_frame_yolo.append(yolo_dets)
-                persons = self.yolo_detector.get_persons(yolo_dets)
-                per_frame_yolo_persons.append(persons)
-
-                poses = batch_poses[j]
-                per_frame_poses.append(poses)
-
-                t0 = time.perf_counter()
-                hands, objects = self.hand_detector.detect(frame)
-                t_hands23 += time.perf_counter() - t0
-                per_frame_hands.append(hands)
-                per_frame_objects.append(objects)
-
-                # Update early stop monitor
-                monitor.update("hand_visibility",
-                    eval_hand_visibility(hands, self.config.hand_confidence_threshold,
-                                         frame_w, frame_h, self.config.hand_frame_margin))
-                monitor.update("face_presence",
-                    eval_face_presence(faces, self.config.face_confidence_threshold))
-                monitor.update("participants",
-                    eval_participants(persons, faces, hands, frame_h, frame_w,
-                        self.config.person_confidence_threshold, 0.5, 0.15))
-                monitor.update("hand_object_interaction",
-                    eval_hand_object_interaction(hands))
-                monitor.update("pov_hand_angle",
-                    eval_pov_hand_angle(hands, frame_h, frame_w,
-                        self.config.angle_threshold, self.config.diagonal_fov_degrees))
-                monitor.update("body_part_visibility",
-                    eval_body_part_visibility(poses, hands, frame_h, frame_w,
-                        0.4, self.config.body_part_keypoint_conf))
-
-                monitor.advance_frame()
-                frames_inferred = i + 1
-
-                if (frames_inferred) % 10 == 0 or frames_inferred == total_frames:
-                    print(f"  Processed frame {frames_inferred}/{total_frames}")
-
-                if monitor.all_determined():
-                    break
-
-        if frames_inferred < total_frames:
-            print(f"  Early stopped at frame {frames_inferred}/{total_frames} "
-                  f"(all checks determined)")
-
-        timings["scrfd"] = t_scrfd
-        timings["yolo"] = t_yolo
-        timings["yolo_pose"] = t_pose
-        timings["hands23"] = t_hands23
-
-        # Grounding DINO on all frames for privacy detection
-        per_frame_gdino = [[] for _ in range(frames_inferred)]
-        t_gdino = 0.0
-        if self.gdino_detector:
-            print(f"  Running Grounding DINO on {frames_inferred} frames...")
-            for idx in range(frames_inferred):
-                t0 = time.perf_counter()
-                gdino_dets = self.gdino_detector.detect(
-                    frames[idx],
-                    text_prompt=self.config.gdino_text_prompt,
-                    box_threshold=self.config.privacy_gdino_threshold,
-                )
-                t_gdino += time.perf_counter() - t0
-                per_frame_gdino[idx] = gdino_dets
-        timings["grounding_dino"] = t_gdino
-
-        # ── Collect motion analysis results (if ran in parallel) ──
-        if motion_future is not None:
-            stability_result, frozen_result, t_stab, t_froz = motion_future.result()
-            motion_executor.shutdown(wait=False)
-            results["motion_camera_stability"] = stability_result
-            results["motion_frozen_segments"] = frozen_result
-            timings["camera_stability"] = t_stab
-            timings["frozen_segments"] = t_froz
-            print(f"Motion analysis ({t_stab:.2f}s stability, {t_froz:.2f}s frozen)")
-
-        # ── Step 6: ML checks ────────────────────────────────────
-        # For determined checks, build results directly from monitor.
-        # For undetermined checks (all frames processed), use original functions.
-        print("Running ML checks...")
-
-        _es_details = {"early_stopped": True, "frames_inferred": frames_inferred,
-                       "total_frames": total_frames}
-
-        # -- face_presence
-        status, passes, processed = monitor.get_result("face_presence")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_face_presence"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_face_presence"] = check_face_presence(
-                per_frame_faces,
-                confidence_threshold=self.config.face_confidence_threshold,
+                frozen_max_consecutive=self.config.frozen_max_consecutive,
+                frozen_trans_threshold=self.config.frozen_trans_threshold,
+                frozen_rot_threshold=self.config.frozen_rot_threshold,
             )
 
-        # -- participants
-        status, passes, processed = monitor.get_result("participants")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_participants"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_participants"] = check_participants(
-                per_frame_yolo_persons, per_frame_faces, per_frame_hands,
-                frame_dims=(frame_h, frame_w),
-                pass_rate_threshold=self.config.participant_pass_rate,
-                person_conf_threshold=self.config.person_confidence_threshold,
-            )
+        motion_future = motion_executor.submit(_run_motion)
 
-        # -- hand_visibility
-        status, passes, processed = monitor.get_result("hand_visibility")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_hand_visibility"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "both_hands_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_hand_visibility"] = check_hand_visibility(
-                per_frame_hands,
-                frame_dims=(frame_h, frame_w),
-                confidence_threshold=self.config.hand_confidence_threshold,
-                pass_rate_threshold=self.config.hand_pass_rate,
-                frame_margin=self.config.hand_frame_margin,
-            )
-
-        # -- hand_object_interaction
-        status, passes, processed = monitor.get_result("hand_object_interaction")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_hand_object_interaction"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "interaction_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_hand_object_interaction"] = check_hand_object_interaction(
-                per_frame_hands,
-                pass_rate_threshold=self.config.interaction_pass_rate,
-            )
-
-        # -- privacy_safety (GDINO on all frames, collects timestamps)
-        results["ml_privacy_safety"] = check_privacy_safety(
-            per_frame_gdino,
-            gdino_conf_threshold=self.config.privacy_gdino_threshold,
-            frame_timestamps_sec=frame_timestamps_sec,
+        # Luminance & blur
+        lb_config = LuminanceBlurConfig(
+            min_good_ratio=self.config.luminance_blur_min_good_ratio,
+            max_brightness_std=self.config.max_brightness_std,
+        )
+        check_results["luminance_blur"] = check_luminance_blur(
+            seg_frames, config=lb_config,
         )
 
-        # -- view_obstruction (CPU-only, no ML models, no early stopping)
-        results["ml_view_obstruction"] = check_view_obstruction(
-            frames,
+        # Hand visibility: both-hands >=80% OR single-hand >=90%
+        check_results["ml_hand_visibility"] = check_hand_visibility(
+            per_frame_hands,
+            frame_dims=(seg_h, seg_w),
+            confidence_threshold=self.config.hand_confidence_threshold,
+            both_hands_pass_rate=self.config.hand_pass_rate,
+            single_hand_pass_rate=self.config.single_hand_pass_rate,
+            frame_margin=self.config.hand_frame_margin,
+        )
+
+        # Hand-object interaction (Phase 2 threshold: 0.60)
+        check_results["ml_hand_object_interaction"] = check_hand_object_interaction(
+            per_frame_hands,
+            pass_rate_threshold=self.config.interaction_pass_rate,
+        )
+
+        # View obstruction
+        check_results["ml_view_obstruction"] = check_view_obstruction(
+            seg_frames,
             max_obstructed_ratio=self.config.obstruction_max_ratio,
         )
 
-        # -- pov_hand_angle
-        status, passes, processed = monitor.get_result("pov_hand_angle")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_pov_hand_angle"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "passing_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_pov_hand_angle"] = check_pov_hand_angle(
-                per_frame_hands,
-                frame_dims=(frame_h, frame_w),
-                angle_threshold=self.config.angle_threshold,
-                pass_rate_threshold=self.config.angle_pass_rate,
-                diagonal_fov_degrees=self.config.diagonal_fov_degrees,
-            )
+        # POV hand angle
+        check_results["ml_pov_hand_angle"] = check_pov_hand_angle(
+            per_frame_hands,
+            frame_dims=(seg_h, seg_w),
+            angle_threshold=self.config.angle_threshold,
+            pass_rate_threshold=self.config.angle_pass_rate,
+            diagonal_fov_degrees=self.config.diagonal_fov_degrees,
+        )
 
-        # -- body_part_visibility
-        status, passes, processed = monitor.get_result("body_part_visibility")
-        if status is not None and frames_inferred < total_frames:
-            results["ml_body_part_visibility"] = CheckResult(
-                status=status,
-                metric_value=round(passes / processed, 4) if processed else 0.0,
-                confidence=1.0,
-                details={**_es_details, "clean_frames": passes, "frames_processed": processed},
-            )
-        else:
-            results["ml_body_part_visibility"] = check_body_part_visibility(
-                per_frame_poses, per_frame_hands,
-                frame_dims=(frame_h, frame_w),
-                pass_rate_threshold=self.config.body_part_pass_rate,
-                keypoint_conf_threshold=self.config.body_part_keypoint_conf,
-            )
+        # Face presence (strict): zero tolerance for any frame with a
+        # confident face, even if Phase 1 let a short flash through.
+        check_results["ml_face_presence"] = check_face_presence(
+            per_frame_faces,
+            confidence_threshold=self.config.face_confidence_threshold,
+        )
 
-        # ── Summary ──────────────────────────────────────────────
-        total_time = sum(timings.values())
-        timings["total"] = total_time
+        # Collect motion results
+        stability_result, frozen_result = motion_future.result()
+        check_results["motion_camera_stability"] = stability_result
+        check_results["motion_frozen_segments"] = frozen_result
 
-        print(f"\nTiming breakdown:")
-        print(f"  Metadata:         {timings['metadata']:.2f}s")
-        print(f"  Frame extraction: {timings['frame_extraction']:.2f}s")
-        print(f"  Luminance & blur: {timings['luminance_blur']:.2f}s")
-        print(f"  Camera stability: {timings['camera_stability']:.2f}s")
-        print(f"  Frozen segments:  {timings['frozen_segments']:.2f}s")
-        print(f"  SCRFD:            {timings['scrfd']:.2f}s")
-        print(f"  YOLO:             {timings['yolo']:.2f}s")
-        print(f"  YOLO-pose:        {timings['yolo_pose']:.2f}s")
-        print(f"  Hands23:          {timings['hands23']:.2f}s")
-        print(f"  Grounding DINO:   {timings['grounding_dino']:.2f}s")
-        print(f"  TOTAL:            {total_time:.2f}s")
-        if frames_inferred < total_frames:
-            print(f"  (early stopped at {frames_inferred}/{total_frames} frames)")
+        # Determine pass/fail
+        failing_checks = [
+            name for name, r in check_results.items()
+            if r.status == "fail"
+        ]
+        passed = len(failing_checks) == 0
 
-        print(f"\nCheck results:")
-        for name, result in results.items():
-            flag = ""
-            if result.status == "pass" and result.confidence < 0.7:
-                flag = " (low confidence)"
-            print(f"  {name:<35} {result.status:>7}  "
-                  f"metric={result.metric_value:.4f}  conf={result.confidence:.4f}{flag}")
+        for name, r in check_results.items():
+            print(f"    {name:<35} {r.status:>7}  "
+                  f"metric={r.metric_value:.4f}")
 
-        return results
+        return SegmentValidationResult(
+            segment=segment,
+            passed=passed,
+            check_results=check_results,
+            failing_checks=failing_checks,
+        )
 
+    # ── Phase 3 ──────────────────────────────────────────────────────
 
-# Backward compatibility alias
-MLCheckPipeline = ValidationPipeline
+    def _phase3_yield(
+        self,
+        original_duration: float,
+        segment_results: list[SegmentValidationResult],
+    ) -> tuple[float, float, float]:
+        """Calculate usable/unusable durations and yield.
+
+        Returns:
+            (usable_sec, unusable_sec, yield_ratio)
+        """
+        usable_sec = sum(
+            sr.segment.duration for sr in segment_results if sr.passed
+        )
+        unusable_sec = original_duration - usable_sec
+        yield_ratio = usable_sec / original_duration if original_duration > 0 else 0.0
+
+        return (
+            round(usable_sec, 2),
+            round(unusable_sec, 2),
+            round(yield_ratio, 4),
+        )
 
 
 if __name__ == "__main__":
     import sys
 
     video_path = sys.argv[1] if len(sys.argv) > 1 else "bachman_cortex/sample_data/test_30s.mp4"
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "bachman_cortex/results/test"
 
     config = PipelineConfig(
         sampling_fps=1.0,
-        max_frames=10,
-        run_grounding_dino=True,
     )
 
-    pipeline = ValidationPipeline(config)
-    results = pipeline.process_video(video_path)
+    pipeline = ValidationProcessingPipeline(config)
+    result = pipeline.process_video(video_path, output_dir)
+    print(f"\nYield: {result.yield_ratio:.1%}")
+    print(f"Usable: {result.usable_duration_sec:.1f}s / {result.original_duration_sec:.1f}s")

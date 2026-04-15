@@ -1,6 +1,6 @@
 # Video Validation Pipeline: Research, Model Selection & Implementation Context
 
-**Date:** 2026-03-30 (updated 2026-03-31)
+**Date:** 2026-03-30 (updated 2026-04-14)
 **Project:** Bachman — Egocentric Video Validation & Submission Tool
 **Author:** Adnaan (PM, Humyn Labs) + Claude Code
 
@@ -13,29 +13,28 @@ Humyn Labs is building an egocentric video dataset for **training autonomous hum
 **Scale:** ~5,000 videos/day, each ~500MB, 5+ minutes, 1080p, 30FPS.
 **Target:** <5 min total processing per video.
 
-The pipeline validates 5 categories of checks across 20 total criteria:
+The pipeline validates 5 categories of checks across 21 total criteria:
 1. **Video Metadata** (6 checks) — format, encoding, resolution, frame rate, duration, orientation. Acts as a gate: failure skips all other checks.
 2. **Frame-Level Quality** (3 checks) — average brightness, brightness stability, near-black frames.
 3. **Luminance & Blur** (1 check) — per-frame Tenengrad/luminance classification with segment-level aggregation.
-4. **Motion Analysis** (2 checks) — camera stability via Farneback optical flow, frozen segments via native-FPS SSIM.
-5. **ML Detection** (8 checks) — face presence, participants, hand visibility, hand-object interaction, privacy safety, view obstruction, POV-hand angle, body part visibility.
+4. **Motion Analysis** (2 checks) — camera stability via single-pass LK optical flow at 0.5x (GPU-accelerated when CUDA OpenCV available). LK is computed inline with frame extraction by a stateful `MotionAnalyzer`; Phase 2 stability + frozen-segment checks slice results from the analyzer without re-decoding the video. Frozen segments derived from LK signal (near-zero translation + rotation).
+5. **ML Detection** (6 checks) — face presence (Phase 1 per-frame gate + Phase 2 strict segment check), participants, hand visibility, hand-object interaction, view obstruction, POV-hand angle.
 
 See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 
 ---
 
-## 2. The 8 ML Detection Checks
+## 2. The 6 ML Detection Checks
 
 | # | Check | Criterion | Model |
 |---|---|---|---|
-| 1 | Face Presence | Face detection confidence < 0.8 in ALL frames | SCRFD-2.5GF |
+| 1 | Face Presence (Phase 1 gate) | Per-frame: face detection confidence < 0.8. Bad runs > `--min-bad-segment` s are excluded from checkable segments. | SCRFD-2.5GF |
+| 1b | Face Presence (Phase 2 strict) | Zero sampled frames in the segment contain a face at conf ≥ 0.8 (no tolerance for brief flashes that survive Phase 1). | SCRFD-2.5GF (detections reused from Phase 1 cache) |
 | 2 | Participants | 0 other persons (face or body parts) in ≥ 90% frames | YOLO11m + SCRFD |
-| 3 | Hand Visibility | Both hands fully in frame (bbox > 2 px from every edge, ≥ 0.7 conf) in ≥ 90% frames | Hands23 |
+| 3 | Hand Visibility | Both hands fully in frame in ≥ 80% frames **OR** at least one hand fully in frame in ≥ 90% frames (bbox clear of every edge, ≥ 0.7 conf) | Hands23 |
 | 4 | Hand-Object Interaction | Interaction detected in ≥ 70% frames | Hands23 (contact state) |
-| 5 | Privacy Safety | Sensitive objects = 0 in ALL frames | Grounding DINO zero-shot on all frames |
-| 6 | View Obstruction | ≤ 10% frames obstructed | OpenCV heuristic (no ML) |
-| 7 | POV-Hand Angle | Angle from center to hands < 40° in ≥ 80% frames | Geometric computation on Hands23 output |
-| 8 | Body Part Visibility | Only hands/forearms (up to elbows) visible in ≥ 90% frames | YOLO11m-pose keypoint detection |
+| 5 | View Obstruction | ≤ 10% frames obstructed | OpenCV heuristic (no ML) |
+| 6 | POV-Hand Angle | Angle from center to hands < 40° in ≥ 80% frames | Geometric computation on Hands23 output |
 
 ---
 
@@ -79,22 +78,7 @@ See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 - **Speed:** ~5,141ms/frame CPU (~3.5x slower than Hands23).
 - Available via `./validate.sh --100doh` or `python bachman_cortex/models/download_models.py --100doh`.
 
-#### Grounding DINO (Privacy — Check 5)
-- **Why:** Zero-shot detection of arbitrary text-described objects ("credit card", "ID card", "paper document") without any fine-tuning or training data. 52.5 AP zero-shot on COCO — SOTA.
-- **Why not YOLO-World:** Lower zero-shot accuracy (35.4 vs 52.5 AP). For a zero-tolerance privacy check, accuracy > speed.
-- **Runs on all inferred frames** (not pre-filtered by YOLO). This ensures every sensitive-object detection is captured with exact timestamps for reporting.
-- **Package:** HuggingFace `transformers` (`IDEA-Research/grounding-dino-base`)
-- **Speed:** ~2,757ms/frame CPU
-
-#### YOLO11m-pose (Body Part Visibility — Check 8)
-- **Why:** Detects 17 COCO body keypoints per person. Used to verify that only the wearer's hands and forearms (up to elbows) are visible — no shoulders, torso, hips, legs, or feet.
-- **Why YOLO11m-pose over MediaPipe Pose:** Same rationale as YOLO11m over MediaPipe for other tasks — more robust on egocentric angles.
-- **Wearer identification:** Same heuristic as participants check (bottom-center anchored or overlapping with Hands23 hand detections).
-- **Allowed keypoints:** Left/right elbows (7, 8) and wrists (9, 10). All others (nose, eyes, ears, shoulders, hips, knees, ankles) are flagged.
-- **Package:** `ultralytics` (same as YOLO11m)
-- **Speed:** ~114ms/frame CPU
-
-#### View Obstruction Heuristic (Check 6)
+#### View Obstruction Heuristic (Check 5)
 - **No ML model.** Combines 4 signals on central 80% of frame:
   1. Low spatial variance (std_dev < 15 → homogeneous/covered)
   2. Low edge density (Laplacian variance < 20)
@@ -115,15 +99,12 @@ See [checks.md](../checks.md) for full acceptance conditions and thresholds.
 | HaMeR (Hand Mesh Recovery) | Check 3 | ViT-H backbone ~630M params, ~200-500ms/frame GPU. Overkill — reconstructs full 3D mesh when we only need bbox + confidence. |
 | EgoHOS | Check 4 | Swin-L backbone ~197M params, ~150-300ms/frame GPU. Pixel-level segmentation overkill for binary "is there interaction?" signal. |
 | Ego4D HOI models (SlowFast) | Check 4 | Designed for temporal localization ("when does state change?"), not frame-level binary interaction detection. Can't be directly used. |
-| YOLO-World | Check 5 | Lower zero-shot accuracy (35.4 vs 52.5 AP). For zero-tolerance privacy, accuracy > speed. |
 | RT-DETR | Check 2 | Heavier than YOLO11 for comparable accuracy, less mature deployment. |
 | InsightFace SCRFD (larger variants) | Check 1 | SCRFD-2.5GF sufficient. Larger variants (10GF, 34GF) offer marginal accuracy gain at 4-10x cost. |
 | FrankMocap | Check 3 | Research code, not production-ready. Slower than 100DOH for similar accuracy. |
-| OWL-ViT / OWLv2 | Check 5 | Lower zero-shot accuracy than Grounding DINO. |
-| Florence-2 | Check 5 | General vision foundation model. Slower and less precise than Grounding DINO for detection tasks. |
 | SAM 2 | None | Segmentation model — not needed for any of our detection/classification checks. |
 | Custom YOLO face model | Check 1 | Requires training. SCRFD already SOTA for faces at this compute budget. |
-| Autoencoder anomaly detection | Check 6 | Requires training on data distribution. Overkill for physical lens blockage detection. |
+| Autoencoder anomaly detection | Check 5 | Requires training on data distribution. Overkill for physical lens blockage detection. |
 
 ---
 
@@ -164,7 +145,6 @@ Tested on 2026-03-30 with synthetic 30s 1080p test video.
 | SCRFD-2.5GF | 9.1 | 11.3 | 9.6 | 2.9s |
 | YOLO11m | 86.8 | 101.2 | 88.2 | 26.5s |
 | 100DOH (ResNet-101) | 5,095 | 5,567 | 5,141 | 25.7 min |
-| Grounding DINO (base) | 2,753 | 2,787 | 2,757 | ~41s (15 flagged) |
 
 **Total estimated per 5-min video:**
 - CPU: ~27 min (dominated by 100DOH)
@@ -207,26 +187,109 @@ After patching, compiled with `python setup.py build develop --no-build-isolatio
 Video file
   → Metadata checks (ffprobe, no frames needed)
   → IF metadata fails: return metadata results + SKIPPED for all others
-  → Frame extraction (cv2.VideoCapture, 1 FPS)
-  → Frame-level quality checks (brightness, stability, near-black)
-  → Luminance & blur check (Tenengrad + luminance decision table)
-  → Motion analysis:
-      - Camera stability (Farneback optical flow on sampled pairs)
-      - Frozen segments (SSIM at native FPS, streaming)
-  → Per frame (ML):
-      1. SCRFD face detection (~10ms)
-      2. YOLO11m object detection (~88ms)
-      3. YOLO11m-pose keypoint detection (~114ms)
-      4. Hands23 hand-object detection (~1.4s CPU / ~100-200ms GPU)
-      5. View obstruction heuristic (<1ms)
-  → Grounding DINO on all inferred frames for privacy (~2.8s/frame CPU)
-  → Distribute results to 8 ML check functions
-  → Aggregate all 20 check results
+  → Single-pass decode (NVDEC via cv2.cudacodec.VideoReader when available,
+    else cv2.VideoCapture) @ 1 FPS sampling. Native-rate stream tees into
+    a stateful MotionAnalyzer (LK optical flow accumulator) at its
+    frame_skip cadence (native_fps / target_fps, default target 30).
+  → Phase 1 downscale: each sampled frame resized to 720p long-edge once
+    (PipelineConfig.phase1_long_edge) — feeds all ML models in Phase 1.
+  → Phase 1 ML batch loop:
+      1. YOLO11s batched object detection (16-frame batches)
+      2. SCRFD face detection dispatched across batch via ThreadPool
+         (PipelineConfig.scrfd_threads, default 4)
+      3. Hands23 hand-object detection (per frame, Detectron2 predictor)
+  → Phase 1 evaluation: face + participant per-frame pass/fail →
+    bad segments → overlap merge → good segments → filter by min duration
+  → Checkable segments → Phase 2 per-segment validation:
+      - Luminance & blur (Tenengrad + luminance decision table)
+      - View obstruction heuristic
+      - Hand visibility / hand-object interaction / POV-hand angle
+        (reused from Phase 1 cache)
+      - Face presence (strict, zero-tolerance — reused SCRFD cache)
+      - Motion stability + frozen segments (sliced from MotionAnalyzer,
+        no re-decode)
+  → Phase 3 yield calculation
 ```
 
-### Grounding DINO Privacy Detection
+### MotionAnalyzer (single-pass LK, 2026-04-13)
 
-Privacy check runs Grounding DINO on all inferred frames with text prompt: `"laptop screen . computer monitor . smartphone screen . paper document . credit card . ID card . identification card . bank card"`. This ensures complete coverage — every sensitive-object detection is captured with HH:MM:SS timestamps for reporting. Privacy safety is excluded from early stopping so all frames are scanned.
+`bachman_cortex/checks/motion_analysis.py` defines a `MotionAnalyzer`
+dataclass that accumulates per-second LK translation / rotation arrays
+plus per-sampled-frame frozen state as `frame_extractor.extract_frames`
+walks the video. The analyzer is created once in
+`ValidationProcessingPipeline.process_video` before extraction and passed
+to the extractor via the `motion_analyzer` kwarg. Extraction calls
+`analyzer.process_frame(frame_bgr, frame_idx)` at the analyzer's
+`frame_skip` cadence.
+
+Phase 2's motion check is `check_motion_combined_from_analyzer(analyzer,
+start_sec, end_sec, ...)` — it derives stability + frozen results from
+the pre-populated analyzer, no `cv2.VideoCapture` re-open. LK numerical
+path is identical to the original `check_motion_combined` (same
+`_lk_track`, same `_transforms_to_score` scoring).
+
+Replaces the prior design where Phase 1 did a full decode and Phase 2
+re-decoded each segment's range on CPU. Observed impact on a 501 s /
+2336×1080 LATAM sample: total 133 s → 116 s (default config, after
+CUDA OpenCV and NVDEC land).
+
+### Custom CUDA OpenCV + NVDEC (2026-04-13)
+
+PyPI's `opencv-python` ships without CUDA. To unlock
+`cv2.cuda.SparsePyrLKOpticalFlow` (used by the MotionAnalyzer) and
+`cv2.cudacodec.VideoReader` (NVDEC hardware decode used by
+`frame_extractor.extract_frames`), the project ships a build script:
+
+`scripts/install_opencv_cuda.sh`
+
+The script:
+- `apt install`s CUDA toolkit + build deps (needs sudo password once).
+- Expects `NVCODEC_SDK` env var pointing at an extracted NVIDIA Video
+  Codec SDK 12.x tree (user downloads from developer.nvidia.com — behind
+  a free login). Copies `nvcuvid.h`, `cuviddec.h`, `nvEncodeAPI.h` to
+  `/usr/include/` and the stub libs to `/usr/lib/x86_64-linux-gnu/`.
+- Clones OpenCV 4.10 + opencv_contrib, configures with `WITH_CUDA=ON`,
+  `WITH_CUDNN=OFF`, `WITH_NVCUVID=ON`, `WITH_NVCUVENC=ON`.
+- Pins CUDA host compiler to `gcc-12` (CUDA 12.0's nvcc caps at gcc 12;
+  Ubuntu 24.04's default `cc` is gcc 13, which nvcc rejects).
+- Sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake 4.x dropped support for
+  OpenCV 4.10's `cmake_minimum_required(VERSION 2.8)` in some sub-scripts).
+- Disables `BUILD_opencv_dnn` and `BUILD_opencv_mcc` — the OpenCV 4.10
+  pyopencv bindings for dnn (pyopencv_dnn.hpp referencing `dnn::`
+  without namespace qualifier) and mcc (abstract `cv::mcc::CChecker`
+  passed to `makePtr`) fail to compile on this host toolchain. Both
+  modules are unused by the project (we use ORT / PyTorch for inference
+  and don't need color calibration).
+- Disables `OPENCV_GENERATE_PKGCONFIG` (CMake 4.x compat).
+- Pre-resizes rather than ninja-installing `opencv4.pc`.
+
+After the build the venv's cv2 module has:
+- `cv2.cuda.SparsePyrLKOpticalFlow` — picked up automatically by
+  `motion_analysis._CUDA_LK` at import time.
+- `cv2.cudacodec.VideoReader` — detected at import time by
+  `frame_extractor._nvdec_available()`. When true, `extract_frames`
+  opens the video via `cv2.cudacodec.createVideoReader`, iterates
+  `nextFrame()`, converts BGRA → BGR on GPU (`cv2.cuda.cvtColor`),
+  downloads to CPU only at sample / motion points.
+- `extract_frames` metadata dict includes `backend: "nvdec" | "cpu"` to
+  tell consumers which path ran.
+
+### `cv2.dnn` compat shim (2026-04-13)
+
+Because the custom OpenCV build disables `cv2.dnn`, the only project
+dependency that relies on `cv2.dnn.blobFromImage` — `insightface`'s SCRFD
+preprocessing — would crash on the new cv2.
+
+`bachman_cortex/_cv2_dnn_shim.py` provides pure-numpy implementations of
+`blobFromImage` and `blobFromImages` (resize → optional BGR→RGB swap →
+mean-subtract → scale → NCHW float32 layout). `bachman_cortex/__init__.py`
+imports the shim and calls `install()`, which attaches a `cv2.dnn`
+module object with those two functions *only if* `cv2.dnn` is not
+already present (i.e. no-op on the standard pip wheel).
+
+The shim's signature mirrors OpenCV's C++ `blobFromImage`. Because
+insightface never calls DNN inference via cv2 (it uses ONNX Runtime),
+replacing only the preprocessing helpers is sufficient.
 
 ### Check 2 Participants — Wearer Filtering
 
@@ -246,39 +309,41 @@ hl-bachman/
 ├── pyproject.toml                      # Package configuration (hl-video-validation)
 ├── checks.md                           # Check specifications and thresholds
 ├── README.md
+├── scripts/
+│   └── install_opencv_cuda.sh          # Build custom OpenCV with CUDA + NVDEC
 └── bachman_cortex/
-    ├── __init__.py
-    ├── pipeline.py                     # ValidationPipeline orchestrator
+    ├── __init__.py                     # Installs cv2.dnn shim before any import
+    ├── _cv2_dnn_shim.py                # Pure-numpy blobFromImage / blobFromImages
+    ├── pipeline.py                     # ValidationProcessingPipeline orchestrator
     ├── run_batch.py                    # CLI entry point (hl-validate)
+    ├── data_types.py                   # Shared dataclasses
+    ├── reporting.py                    # Per-video + batch report generation
     ├── CONTEXT.md                      # This file
     ├── checks/
     │   ├── check_results.py            # CheckResult dataclass
     │   ├── video_metadata.py           # 6 metadata checks
-    │   ├── frame_quality.py            # 3 brightness checks
     │   ├── luminance_blur.py           # Tenengrad + luminance decision table
-    │   ├── motion_analysis.py          # Optical flow + frozen segment detection
-    │   ├── face_presence.py            # Face detection check
+    │   ├── motion_analysis.py          # MotionAnalyzer (single-pass LK) + slicer
     │   ├── participants.py             # Person count check
     │   ├── hand_visibility.py          # Hand detection check
     │   ├── hand_object_interaction.py  # Contact state check
-    │   ├── privacy_safety.py           # Sensitive object detection
     │   ├── view_obstruction.py         # Lens obstruction heuristic
     │   ├── pov_hand_angle.py           # Hand angle check
-    │   └── body_part_visibility.py    # Body part keypoint check
+    │   └── face_presence.py            # Strict segment-level face presence
     ├── models/
     │   ├── download_models.py          # Model weight downloader
-    │   ├── scrfd_detector.py           # SCRFD face detector
-    │   ├── yolo_detector.py            # YOLO11m object detector
-    │   ├── yolo_pose_detector.py       # YOLO11m-pose keypoint detector
+    │   ├── scrfd_detector.py           # SCRFD (cuDNN HEURISTIC autotune)
+    │   ├── yolo_detector.py            # YOLO11s object detector
     │   ├── hand_detector.py            # Hands23 hand-object detector
-    │   ├── grounding_dino_detector.py  # Zero-shot privacy detector
-    │   └── weights/                    # ~1.5GB, downloaded on first run
+    │   └── weights/                    # ~440MB, downloaded on first run
     └── utils/
-        ├── frame_extractor.py          # Video frame sampling
-        └── video_metadata.py           # FFprobe metadata extraction
+        ├── frame_extractor.py          # NVDEC-or-VideoCapture decode + motion tee
+        ├── video_metadata.py           # FFprobe metadata extraction
+        ├── segment_ops.py               # Segment merging / filtering
+        └── early_stop.py                # Per-frame eval helpers
 ```
 
-**YOLO weights** (`yolo11m.pt`, `yolo11m-pose.pt`) are downloaded by ultralytics on first run (~40MB each).
+**YOLO weights** (`yolo11s.pt`) are downloaded by ultralytics on first run (~20MB).
 
 ---
 
@@ -308,7 +373,6 @@ tqdm>=4.65
    - Tune confidence thresholds for each check
    - Measure false positive/negative rates
    - Validate 100DOH hand detection accuracy on agricultural/commercial/residential tasks
-   - Calibrate Grounding DINO text prompts for sensitive objects
 
 2. **GPU testing** — 100DOH at 5s/frame on CPU is the bottleneck. Need to test on A10G GPU to confirm ~100-150ms/frame.
 
@@ -316,14 +380,11 @@ tqdm>=4.65
    - Face confidence threshold (0.8)
    - Person confidence threshold (0.4)
    - Hand confidence threshold (0.7)
-   - Privacy YOLO/GDINO thresholds (0.6/0.3)
    - Obstruction heuristic thresholds
 
-4. **Phase 2 Privacy:** If Grounding DINO has too many false positives on real data, fine-tune YOLO11m on labeled sensitive objects.
+4. **Containerization:** Create Docker image with all models + CUDA for AWS ECS deployment.
 
-5. **Containerization:** Create Docker image with all models + CUDA for AWS ECS deployment.
-
-6. **Integration:** Wire pipeline into Celery workers for the FastAPI backend described in the idea brief.
+5. **Integration:** Wire pipeline into Celery workers for the FastAPI backend described in the idea brief.
 
 ---
 
@@ -335,8 +396,6 @@ tqdm>=4.65
 | Hands23 over 100DOH | NeurIPS 2023 successor, 250K training images, no C++ compilation, ~3.5x faster on CPU |
 | Hands23 over MediaPipe for hands | MediaPipe has 29-97% AP on egocentric data; Hands23 trained on egocentric datasets |
 | SCRFD over MediaPipe for faces | 93.8% AP on WIDER hard set; MediaPipe optimized for webcam |
-| Grounding DINO over fine-tuned YOLO for privacy | Zero-shot capability for arbitrary sensitive objects without training data |
-| GDINO on all frames for privacy | Ensures complete timestamp reporting; no frames missed by pre-filter |
 | Hands23 input downscaling (720p default) | Reduces inference time on the most expensive model with negligible accuracy impact |
 | Heuristic over ML for view obstruction | No standard ML model exists; signal is fundamentally low-level |
 | YOLO11m over YOLO11n | 51.5 vs 39.5 mAP; person detection is safety-critical for privacy |
@@ -344,7 +403,14 @@ tqdm>=4.65
 | Farneback over Lucas-Kanade for stability | Dense optical flow gives more accurate camera motion estimate |
 | Native FPS for frozen segments | 30 consecutive frames = 1 second; sampled frames would miss short freezes |
 | 1 FPS sampling for ML checks | 120 frames gives sufficient temporal coverage; configurable for GPU |
-| YOLO11m-pose for body part visibility | Same ultralytics ecosystem as YOLO11m, no new dependencies. 17-keypoint detection identifies which body parts are visible. Allowed: wrists + elbows only (hands through forearms). |
+| Single-pass decode (2026-04-13) | Phase 1 extraction and Phase 2 motion analysis share one cv2 read pass. MotionAnalyzer accumulates per-second LK trans/rot inline; Phase 2 slices without re-decoding. Cuts LATAM 501s video 133s → 116s default config. |
+| Phase 1 720p downscale (2026-04-13) | Feeds YOLO / SCRFD / Hands23 with ~2.3× fewer pixels than native 1080p. Frame cache also capped at 720p — halves Phase 1 peak memory. |
+| Threaded SCRFD (2026-04-13) | `FaceAnalysis.get()` isn't batch-capable and releases the GIL inside ORT `run()`. 4-worker ThreadPoolExecutor overlaps SCRFD with YOLO / Hands23 in the inner loop (~1.2× Phase 1 win). |
+| cuDNN HEURISTIC on SCRFD (2026-04-13) | ORT defaults to `cudnn_conv_algo_search=EXHAUSTIVE` which adds 2-3s to first inference per new input shape. HEURISTIC smoothes p99 at negligible throughput cost. |
+| Custom OpenCV-CUDA build (2026-04-13) | PyPI cv2 has no CUDA. Building from source unlocks `cv2.cuda.SparsePyrLKOpticalFlow` (GPU motion) and `cv2.cudacodec.VideoReader` (NVDEC decode). Drops LATAM 501s video extraction 46.6s → 32.8s. Cost: ~60 min one-time build via scripts/install_opencv_cuda.sh. |
+| Skip cv2.dnn / cv2.mcc in custom build (2026-04-13) | OpenCV 4.10's pyopencv_dnn.hpp and opencv_contrib/mcc bindings fail to compile on CMake 4.x + gcc-12. Neither module is used by the project; insightface's blobFromImage is reproduced in `_cv2_dnn_shim.py`. |
+| Removed privacy, body-part-visibility, and egocentric checks (2026-04-15) | Three checks retired and their code/models deleted. Grounding DINO (privacy), YOLO11m-pose (body-part-visibility), and the egocentric-perspective heuristic are all gone. Face presence was previously the opt-in replacement for egocentric; it is now an always-on Phase 2 strict check (zero sampled frames with face conf ≥ 0.80) that reuses SCRFD detections from Phase 1. Simplifies config (no opt-in flags remain for ML checks), drops ~1.1 GB of model weights, and shrinks the surface area of Phase 1 / Phase 2 to the checks that actually run. |
+| Timestamps-only reporting (2026-04-14) | Dropped ffmpeg clip extraction entirely (`clip_extractor.py` removed). Per-video `report.md` is now a unified chronological `HH:MM:SS.mmm` timeline labeling each contiguous range **USABLE / UNUSABLE / REJECTED** with failing-check reasons and observed metrics. Metadata-fail videos render as one REJECTED row spanning the whole video. Dataclasses renamed (`PreFilteredClip` → `CheckableSegment`, `ClipValidationResult` → `SegmentValidationResult`). `--min-segment` default raised 30→60s so Phase 2 pass-rate metrics stay statistically meaningful; clean gaps below the threshold render as `UNUSABLE (segment_too_short)`. |
 
 ---
 

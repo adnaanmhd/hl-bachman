@@ -127,47 +127,6 @@ def benchmark_100doh(frames: list[np.ndarray]) -> dict:
     return result
 
 
-def benchmark_grounding_dino(frames: list[np.ndarray]) -> dict:
-    """Benchmark Grounding DINO zero-shot detector."""
-    print("\n" + "=" * 60)
-    print("Grounding DINO (zero-shot, base)")
-    print("=" * 60)
-
-    from bachman_cortex.models.grounding_dino_detector import GroundingDINODetector
-
-    detector = GroundingDINODetector(
-        cache_dir=os.path.join(ROOT, "bachman_cortex/models/weights/grounding_dino"),
-    )
-
-    text_prompt = "laptop screen . computer monitor . smartphone screen . paper document . credit card . ID card"
-
-    # Warmup
-    print("Warmup (2 frames)...")
-    for f in frames[:2]:
-        detector.detect(f, text_prompt=text_prompt)
-
-    # Benchmark (use fewer frames due to CPU cost)
-    bench_frames = frames[:5]
-    print(f"Benchmarking on {len(bench_frames)} frames (subset for CPU)...")
-    result = detector.benchmark(bench_frames, text_prompt=text_prompt)
-
-    # Count detections
-    total_dets = 0
-    labels_seen = {}
-    for f in bench_frames:
-        dets = detector.detect(f, text_prompt=text_prompt)
-        total_dets += len(dets)
-        for d in dets:
-            labels_seen[d.label] = labels_seen.get(d.label, 0) + 1
-
-    result["total_detections"] = total_dets
-    result["labels_seen"] = labels_seen
-    print(f"  p50: {result['p50_ms']:.1f}ms | p95: {result['p95_ms']:.1f}ms | mean: {result['mean_ms']:.1f}ms")
-    print(f"  Total detections: {total_dets}")
-    print(f"  Labels: {labels_seen}")
-    return result
-
-
 def main():
     video_path = os.path.join(ROOT, "bachman_cortex/sample_data/test_30s.mp4")
     print(f"Extracting frames from {video_path}...")
@@ -182,7 +141,6 @@ def main():
     results["scrfd"] = benchmark_scrfd(frames)
     results["yolo11m"] = benchmark_yolo(frames)
     results["100doh"] = benchmark_100doh(frames)
-    results["grounding_dino"] = benchmark_grounding_dino(frames)
 
     # Summary
     print("\n" + "=" * 60)
@@ -190,7 +148,7 @@ def main():
     print("=" * 60)
     print(f"{'Model':<40} {'p50 ms':>8} {'p95 ms':>8} {'mean ms':>8}")
     print("-" * 64)
-    for name in ["scrfd", "yolo11m", "100doh", "grounding_dino"]:
+    for name in ["scrfd", "yolo11m", "100doh"]:
         r = results[name]
         print(f"{r['model']:<40} {r['p50_ms']:>8.1f} {r['p95_ms']:>8.1f} {r['mean_ms']:>8.1f}")
 
@@ -198,19 +156,15 @@ def main():
     scrfd_per_frame = results["scrfd"]["mean_ms"]
     yolo_per_frame = results["yolo11m"]["mean_ms"]
     doh_per_frame = results["100doh"]["mean_ms"]
-    gdino_per_frame = results["grounding_dino"]["mean_ms"]
 
     total_per_frame = scrfd_per_frame + yolo_per_frame + doh_per_frame
     total_300_frames = total_per_frame * 300 / 1000
-    # Grounding DINO only runs on ~5% of frames (pre-filtered)
-    gdino_estimated = gdino_per_frame * 15 / 1000  # ~15 frames
 
     print(f"\nEstimated total for 300 frames (5-min video):")
     print(f"  SCRFD:          {scrfd_per_frame * 300 / 1000:.1f}s")
     print(f"  YOLO11m:        {yolo_per_frame * 300 / 1000:.1f}s")
     print(f"  100DOH:         {doh_per_frame * 300 / 1000:.1f}s")
-    print(f"  Grounding DINO: {gdino_estimated:.1f}s (est. 15 flagged frames)")
-    print(f"  TOTAL:          {total_300_frames + gdino_estimated:.1f}s")
+    print(f"  TOTAL:          {total_300_frames:.1f}s")
 
     # Save results
     output_file = os.path.join(ROOT, "bachman_cortex/tests/benchmark_results.json")

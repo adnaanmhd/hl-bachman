@@ -1,8 +1,11 @@
 """Check 3: Hand Visibility.
 
-Criterion: Both hands detected (>= 0.7 confidence) and fully within the
-frame (bbox at least 2 px from every edge) in >= 90% of frames.
-Purpose: Ensure wearer's hands are completely visible for robot learning.
+Criterion (OR of two conditions):
+  - Both hands fully visible in >= 80% of frames, OR
+  - At least one hand fully visible in >= 90% of frames.
+
+A hand counts as "fully visible" when detected with confidence >= 0.7 and
+its bbox is at least ``frame_margin`` px from every frame edge.
 """
 
 import numpy as np
@@ -24,24 +27,31 @@ def check_hand_visibility(
     per_frame_hands: list[list[HandDetection]],
     frame_dims: tuple[int, int],
     confidence_threshold: float = 0.7,
-    pass_rate_threshold: float = 0.90,
+    both_hands_pass_rate: float = 0.80,
+    single_hand_pass_rate: float = 0.90,
     frame_margin: int = 2,
 ) -> CheckResult:
-    """Check that both hands are fully visible in most frames.
+    """Check hand visibility using an OR of two sub-conditions.
 
-    A hand counts as "fully visible" when it is detected with sufficient
-    confidence AND its bounding box is at least *frame_margin* pixels away
-    from every frame edge (i.e. not clipped).
+    Passes if either:
+      - ``both_hands_ratio >= both_hands_pass_rate`` (primary), or
+      - ``single_hand_ratio >= single_hand_pass_rate`` (fallback).
+
+    "Single hand" means at least one hand is fully visible in the frame, so
+    ``single_hand_ratio >= both_hands_ratio`` always holds.
 
     Args:
         per_frame_hands: Hand detections per frame.
         frame_dims: (height, width) of each frame.
         confidence_threshold: Min confidence for a hand to count as detected.
-        pass_rate_threshold: Fraction of frames requiring both hands fully visible.
-        frame_margin: Min pixel clearance from frame edges (default 2).
+        both_hands_pass_rate: Min fraction of frames with both hands visible.
+        single_hand_pass_rate: Min fraction of frames with at least one hand
+            visible (fallback when the both-hands condition fails).
+        frame_margin: Min pixel clearance from frame edges.
 
     Returns:
-        CheckResult.
+        CheckResult. ``metric_value`` is the both-hands ratio; the single-hand
+        ratio and both thresholds are reported in ``details``.
     """
     total_frames = len(per_frame_hands)
     if total_frames == 0:
@@ -51,8 +61,8 @@ def check_hand_visibility(
     frame_h, frame_w = frame_dims
 
     both_hands_frames = 0
+    single_hand_frames = 0
     both_hands_by_side = 0
-    any_hand_frames = 0
     clipped_frames = 0
 
     for hands in per_frame_hands:
@@ -63,30 +73,33 @@ def check_hand_visibility(
         has_left = any(h.side == HandSide.LEFT for h in in_frame_hands)
         has_right = any(h.side == HandSide.RIGHT for h in in_frame_hands)
 
-        # Primary: 2+ confident, fully-in-frame hand detections.
         # The Hands23 model's left/right classifier can mislabel both hands
-        # as the same side, so we count distinct detections instead.
+        # as the same side, so we count distinct in-frame detections.
         if len(in_frame_hands) >= 2:
             both_hands_frames += 1
-        # Secondary: track side-based count for diagnostics
         if has_left and has_right:
             both_hands_by_side += 1
         if in_frame_hands:
-            any_hand_frames += 1
-        # Track frames where confidence was fine but bbox was clipped
+            single_hand_frames += 1
         if len(confident_hands) >= 2 and len(in_frame_hands) < 2:
             clipped_frames += 1
 
     both_ratio = both_hands_frames / total_frames
-    status = "pass" if both_ratio >= pass_rate_threshold else "fail"
+    single_ratio = single_hand_frames / total_frames
 
-    # Confidence: based on distance from threshold
-    if both_ratio >= pass_rate_threshold:
-        ratio_margin = both_ratio - pass_rate_threshold
-        confidence = min(1.0, 0.7 + ratio_margin * 3)
+    both_passed = both_ratio >= both_hands_pass_rate
+    single_passed = single_ratio >= single_hand_pass_rate
+    status = "pass" if (both_passed or single_passed) else "fail"
+
+    # Confidence: use whichever sub-condition has the best (most positive,
+    # or least negative) margin over its own threshold.
+    both_margin = both_ratio - both_hands_pass_rate
+    single_margin = single_ratio - single_hand_pass_rate
+    best_margin = max(both_margin, single_margin)
+    if best_margin >= 0:
+        confidence = min(1.0, 0.7 + best_margin * 3)
     else:
-        deficit = pass_rate_threshold - both_ratio
-        confidence = max(0.0, 0.5 - deficit * 2)
+        confidence = max(0.0, 0.5 - abs(best_margin) * 2)
 
     return CheckResult(
         status=status,
@@ -94,12 +107,17 @@ def check_hand_visibility(
         confidence=round(confidence, 4),
         details={
             "both_hands_frames": both_hands_frames,
+            "single_hand_frames": single_hand_frames,
             "both_hands_by_side_label": both_hands_by_side,
-            "any_hand_frames": any_hand_frames,
             "clipped_frames": clipped_frames,
             "total_frames": total_frames,
+            "both_hands_ratio": round(both_ratio, 4),
+            "single_hand_ratio": round(single_ratio, 4),
+            "both_hands_pass_rate": both_hands_pass_rate,
+            "single_hand_pass_rate": single_hand_pass_rate,
+            "both_hands_passed": both_passed,
+            "single_hand_passed": single_passed,
             "confidence_threshold": confidence_threshold,
-            "pass_rate_threshold": pass_rate_threshold,
             "frame_margin_px": frame_margin,
         },
     )

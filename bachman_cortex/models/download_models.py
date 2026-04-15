@@ -1,7 +1,7 @@
 """Download all required model weights and set up dependencies for ML checks.
 
 Usage:
-    python bachman_cortex/models/download_models.py          # Download SCRFD, YOLO11m, YOLO11m-pose, Grounding DINO, Hands23
+    python bachman_cortex/models/download_models.py          # Download SCRFD, YOLO11s, Hands23
     python bachman_cortex/models/download_models.py --100doh  # Also download + compile 100DOH (legacy)
     python bachman_cortex/models/download_models.py --all     # Everything including legacy 100DOH
 """
@@ -44,51 +44,10 @@ def download_yolo11s():
     return model
 
 
-def download_yolo11m():
-    """Download YOLO11m model (optional, larger variant)."""
-    print("\n" + "=" * 60)
-    print("2b. YOLO11m Object Detector")
-    print("=" * 60)
-    from ultralytics import YOLO
-
-    model = YOLO("yolo11m.pt")
-    print(f"YOLO11m loaded: {model.model_name}")
-    return model
-
-
-def download_yolo11m_pose():
-    """Download YOLO11m-pose model."""
-    print("\n" + "=" * 60)
-    print("3. YOLO11m-pose Keypoint Detector")
-    print("=" * 60)
-    from ultralytics import YOLO
-
-    model = YOLO("yolo11m-pose.pt")
-    print(f"YOLO11m-pose loaded: {model.model_name}")
-    return model
-
-
-def download_grounding_dino():
-    """Download Grounding DINO model via HuggingFace transformers."""
-    print("\n" + "=" * 60)
-    print("4. Grounding DINO (via HuggingFace)")
-    print("=" * 60)
-    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-
-    model_id = "IDEA-Research/grounding-dino-base"
-    cache_dir = str(MODELS_DIR / "grounding_dino")
-
-    print(f"Downloading {model_id}...")
-    processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, cache_dir=cache_dir)
-    print(f"Grounding DINO loaded: {model_id}")
-    return model, processor
-
-
 def download_hands23():
     """Download Hands23 hand-object detector (NeurIPS 2023)."""
     print("\n" + "=" * 60)
-    print("4. Hands23 Hand-Object Detector (NeurIPS 2023)")
+    print("3. Hands23 Hand-Object Detector (NeurIPS 2023)")
     print("=" * 60)
 
     repo_dir = MODELS_DIR / "hands23_detector"
@@ -319,8 +278,6 @@ if __name__ == "__main__":
 
     download_scrfd()
     download_yolo11s()
-    download_yolo11m_pose()
-    download_grounding_dino()
     download_hands23()
 
     # Legacy 100DOH (only if explicitly requested)

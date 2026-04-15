@@ -33,15 +33,26 @@ def check_encoding(metadata: dict) -> CheckResult:
 
 
 def check_resolution(metadata: dict) -> CheckResult:
-    """Check that resolution is at least 1920x1080."""
+    """Check that displayed resolution is at least 1920x1080.
+
+    Applies the rotation tag first: for rotation 90 or 270, the stored
+    (width, height) are swapped on display.
+    """
     w, h = metadata["width"], metadata["height"]
-    passes = w >= 1920 and h >= 1080
+    rotation = metadata["rotation"]
+    if rotation in (90, 270):
+        disp_w, disp_h = h, w
+    else:
+        disp_w, disp_h = w, h
+    passes = disp_w >= 1920 and disp_h >= 1080
     return CheckResult(
         status="pass" if passes else "fail",
         metric_value=1.0 if passes else 0.0,
         confidence=1.0,
         details={
             "width": w, "height": h,
+            "rotation": rotation,
+            "displayed_width": disp_w, "displayed_height": disp_h,
             "min_width": 1920, "min_height": 1080,
         },
     )
@@ -60,29 +71,39 @@ def check_frame_rate(metadata: dict) -> CheckResult:
 
 
 def check_duration(metadata: dict) -> CheckResult:
-    """Check that duration is at least 180 seconds."""
+    """Check that duration is at least 10 seconds."""
     dur = metadata["duration_s"]
-    passes = dur >= 180.0
+    passes = dur >= 10.0
     return CheckResult(
         status="pass" if passes else "fail",
         metric_value=1.0 if passes else 0.0,
         confidence=1.0,
-        details={"duration_s": dur, "min_duration_s": 180.0},
+        details={"duration_s": dur, "min_duration_s": 10.0},
     )
 
 
 def check_orientation(metadata: dict) -> CheckResult:
-    """Check that rotation is 0 or 180 degrees and video is landscape (width > height)."""
+    """Check that rotation is 0, 90, or 270 and displayed video is landscape.
+
+    Upside-down (rotation=180) is rejected. After applying rotation,
+    displayed_width must be greater than displayed_height.
+    """
     rotation = metadata["rotation"]
     w, h = metadata["width"], metadata["height"]
-    passes = rotation in (0, 180) and w > h
+    if rotation in (90, 270):
+        disp_w, disp_h = h, w
+    else:
+        disp_w, disp_h = w, h
+    passes = rotation in (0, 90, 270) and disp_w > disp_h
     return CheckResult(
         status="pass" if passes else "fail",
         metric_value=1.0 if passes else 0.0,
         confidence=1.0,
         details={
             "rotation": rotation, "width": w, "height": h,
-            "expected_rotation": "0 or 180", "expected": "width > height",
+            "displayed_width": disp_w, "displayed_height": disp_h,
+            "expected_rotation": "0, 90, or 270",
+            "expected": "displayed_width > displayed_height",
         },
     )
 
