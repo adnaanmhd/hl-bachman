@@ -355,55 +355,82 @@ def _review_run_table(
     return lines
 
 
-def _review_section(
+# Per-check display specs: (check_name, value_columns for run table)
+# value_columns: list of (header_label, aggregate_key, decimals)
+_REVIEW_CHECK_SPECS: list[tuple[str, list[tuple[str, str, int]]]] = [
+    ("ml_face_presence", [("Conf (mean / min / max)", "confidence", 2)]),
+    ("ml_hand_visibility", [("Conf (mean / min / max)", "confidence", 2)]),
+    ("ml_hand_object_interaction", [("Conf (mean / min / max)", "confidence", 2)]),
+    (
+        "luminance_blur",
+        [
+            ("Mean Luminance (mean / min / max)", "mean_luminance", 2),
+            ("Norm. Tenengrad (mean / min / max)", "tenengrad_norm", 4),
+            ("Raw Tenengrad (mean / min / max)", "tenengrad_raw", 2),
+        ],
+    ),
+]
+
+
+def compute_review_runs(
     result: VideoProcessingResult,
     frame_interval: float,
-) -> list[str]:
-    """Render the 'Frames Flagged for Review' section."""
-    lines: list[str] = []
-
-    specs = [
-        (
-            "ml_face_presence",
-            _collect_face_review_frames(result, frame_interval),
-            [("Conf (mean / min / max)", "confidence", 2)],
-        ),
-        (
-            "ml_hand_visibility",
-            _collect_segment_review_frames(result, "ml_hand_visibility"),
-            [("Conf (mean / min / max)", "confidence", 2)],
-        ),
-        (
-            "ml_hand_object_interaction",
-            _collect_segment_review_frames(result, "ml_hand_object_interaction"),
-            [("Conf (mean / min / max)", "confidence", 2)],
-        ),
-        (
-            "luminance_blur",
-            _collect_segment_review_frames(result, "luminance_blur"),
-            [
-                ("Mean Luminance (mean / min / max)", "mean_luminance", 2),
-                ("Norm. Tenengrad (mean / min / max)", "tenengrad_norm", 4),
-                ("Raw Tenengrad (mean / min / max)", "tenengrad_raw", 2),
-            ],
-        ),
-    ]
-
-    all_runs: dict[str, list[ReviewRun]] = {}
-    any_runs = False
-    for name, frames, columns in specs:
+) -> dict[str, list[ReviewRun]]:
+    """Compute per-check review runs (collapsed, > 2s only) for a video."""
+    runs_by_check: dict[str, list[ReviewRun]] = {}
+    for name, columns in _REVIEW_CHECK_SPECS:
+        if name == "ml_face_presence":
+            frames = _collect_face_review_frames(result, frame_interval)
+        else:
+            frames = _collect_segment_review_frames(result, name)
         value_keys = [c[1] for c in columns]
-        runs = collapse_review_runs(
+        runs_by_check[name] = collapse_review_runs(
             frames,
             frame_interval=frame_interval,
             min_duration_s=_REVIEW_MIN_DURATION_S,
             value_keys=value_keys,
         )
-        all_runs[name] = runs
-        if runs:
-            any_runs = True
+    return runs_by_check
 
-    if not any_runs:
+
+def _merge_ranges(
+    ranges: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Merge overlapping/touching (start, end) intervals."""
+    if not ranges:
+        return []
+    sorted_ranges = sorted(ranges, key=lambda r: r[0])
+    merged = [sorted_ranges[0]]
+    for start, end in sorted_ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _union_review_duration(
+    runs_by_check: dict[str, list[ReviewRun]],
+) -> float:
+    """Total review duration across all checks, de-duplicated by time."""
+    ranges: list[tuple[float, float]] = []
+    for runs in runs_by_check.values():
+        for r in runs:
+            ranges.append((r.start_sec, r.end_sec))
+    return sum(end - start for start, end in _merge_ranges(ranges))
+
+
+def _pct(num: float, denom: float) -> float:
+    return (num / denom * 100.0) if denom > 0 else 0.0
+
+
+def _review_section(
+    runs_by_check: dict[str, list[ReviewRun]],
+) -> list[str]:
+    """Render the 'Frames Flagged for Review' section."""
+    lines: list[str] = []
+    if not any(runs_by_check.values()):
         return lines
 
     lines.append("---")
@@ -417,8 +444,8 @@ def _review_section(
     )
     lines.append("")
 
-    for name, _frames, columns in specs:
-        runs = all_runs[name]
+    for name, columns in _REVIEW_CHECK_SPECS:
+        runs = runs_by_check.get(name, [])
         if not runs:
             continue
         total_dur = sum(r.duration for r in runs)
@@ -426,6 +453,40 @@ def _review_section(
         lines.append("")
         lines.extend(_review_run_table(runs, columns))
 
+    return lines
+
+
+def _hitl_section(
+    runs_by_check: dict[str, list[ReviewRun]],
+    total_duration: float,
+) -> list[str]:
+    """Render the HITL Involvement section.
+
+    Review % = (review duration) / total_duration. Total row uses the union
+    of review ranges across checks so frames flagged by multiple checks are
+    counted once.
+    """
+    lines: list[str] = []
+    union_dur = _union_review_duration(runs_by_check)
+    total_pct = _pct(union_dur, total_duration)
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## HITL Involvement")
+    lines.append("")
+    lines.append(
+        f"**Total Review:** {total_pct:.1f}% "
+        f"({union_dur:.1f}s / {total_duration:.1f}s)"
+    )
+    lines.append("")
+    lines.append("| Check | Review % | Duration |")
+    lines.append("|---|---|---|")
+    for name, _columns in _REVIEW_CHECK_SPECS:
+        runs = runs_by_check.get(name, [])
+        dur = sum(r.duration for r in runs)
+        pct = _pct(dur, total_duration)
+        lines.append(f"| {name} | {pct:.1f}% | {dur:.1f}s |")
+    lines.append("")
     return lines
 
 
@@ -531,10 +592,12 @@ def write_video_report(
 
     lines.extend(_timeline_table(entries))
 
-    # ── Frames Flagged for Review ────────────────────────────────────
+    # ── Frames Flagged for Review + HITL Involvement ────────────────
     if config is not None and result.metadata_passed:
         frame_interval = 1.0 / config.sampling_fps if config.sampling_fps else 1.0
-        lines.extend(_review_section(result, frame_interval))
+        runs_by_check = compute_review_runs(result, frame_interval)
+        lines.extend(_review_section(runs_by_check))
+        lines.extend(_hitl_section(runs_by_check, result.original_duration_sec))
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
@@ -660,6 +723,39 @@ def write_batch_report(
                 f"{max_conf:.2f} | {threshold} |"
             )
         lines.append("")
+
+    # ── HITL Involvement (batch aggregate) ────────────────────────────
+    frame_interval = 1.0 / config.sampling_fps if config.sampling_fps else 1.0
+    per_check_duration: dict[str, float] = {
+        name: 0.0 for name, _ in _REVIEW_CHECK_SPECS
+    }
+    total_union_duration = 0.0
+    for r in all_results:
+        if r.error or not r.metadata_passed:
+            continue
+        runs_by_check = compute_review_runs(r, frame_interval)
+        for name, runs in runs_by_check.items():
+            per_check_duration[name] += sum(run.duration for run in runs)
+        total_union_duration += _union_review_duration(runs_by_check)
+
+    total_pct = _pct(total_union_duration, total_original)
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## HITL Involvement")
+    lines.append("")
+    lines.append(
+        f"**Total Review:** {total_pct:.1f}% "
+        f"({total_union_duration:.1f}s / {total_original:.1f}s)"
+    )
+    lines.append("")
+    lines.append("| Check | Review % | Duration |")
+    lines.append("|---|---|---|")
+    for name, _columns in _REVIEW_CHECK_SPECS:
+        dur = per_check_duration[name]
+        pct = _pct(dur, total_original)
+        lines.append(f"| {name} | {pct:.1f}% | {dur:.1f}s |")
+    lines.append("")
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
