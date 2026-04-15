@@ -455,14 +455,15 @@ def write_video_report(
         sr.segment.duration for sr in result.segment_results if not sr.passed
     )
 
+    unusable_total = unusable_p1 + unusable_short
+
     lines.append("## Summary")
     lines.append("")
     lines.append("| Metric | Value |")
     lines.append("|---|---|")
     lines.append(f"| Original duration | {result.original_duration_sec:.1f}s |")
     lines.append(f"| Usable | {result.usable_duration_sec:.1f}s |")
-    lines.append(f"| Unusable (Phase 1 filter) | {unusable_p1:.1f}s |")
-    lines.append(f"| Unusable (segment too short) | {unusable_short:.1f}s |")
+    lines.append(f"| Unusable | {unusable_total:.1f}s |")
     lines.append(f"| Rejected (Phase 2 validation) | {rejected_dur:.1f}s |")
     lines.append(f"| **Yield** | **{result.yield_ratio:.1%}** |")
     lines.append(f"| Metadata passed | {'Yes' if result.metadata_passed else 'No'} |")
@@ -490,6 +491,25 @@ def write_video_report(
         accepted, observed = _meta_accepted_observed(name, r)
         lines.append(f"| {name} | **{r.status.upper()}** | {accepted} | {observed} |")
     lines.append("")
+
+    # ── Phase 1: Unusable breakdown ──────────────────────────────────
+    if result.metadata_passed:
+        lines.append("---")
+        lines.append("")
+        lines.append("## Phase 1")
+        lines.append("")
+        lines.append("| Category | Duration | Segments |")
+        lines.append("|---|---|---|")
+        lines.append(
+            f"| Unusable (filtered out: face / participants) | "
+            f"{unusable_p1:.1f}s | {len(result.phase1_bad_segments)} |"
+        )
+        lines.append(
+            f"| Unusable (segment too short for Phase 2) | "
+            f"{unusable_short:.1f}s | {len(result.phase1_discarded_segments)} |"
+        )
+        lines.append(f"| **Total unusable** | **{unusable_total:.1f}s** | — |")
+        lines.append("")
 
     # ── Timeline ─────────────────────────────────────────────────────
     lines.append("---")
