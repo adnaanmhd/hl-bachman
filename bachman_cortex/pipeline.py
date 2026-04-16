@@ -264,6 +264,7 @@ class ValidationProcessingPipeline:
             fps=self.config.sampling_fps,
             max_frames=self.config.max_frames,
             motion_analyzer=motion_analyzer,
+            resize_long_edge=self.config.phase1_long_edge,
         )
         frame_h, frame_w = frame_meta["height"], frame_meta["width"]
         print(f"Extracted {len(frames)} frames ({frame_meta['duration_s']}s video) "
@@ -417,25 +418,14 @@ class ValidationProcessingPipeline:
         list[CheckableSegment],
         dict,
     ]:
-        native_w, native_h = frame_meta["width"], frame_meta["height"]
         original_duration = frame_meta["duration_s"]
 
-        # Downscale frames once to a shared 720p long-edge target. Feeds
-        # YOLO, SCRFD, and Hands23 with ~2.3x fewer pixels than native 1080p
-        # and drops the Phase 1 raw-frame cache size proportionally
-        # (P1.1 + P1.2).
-        target_long = self.config.phase1_long_edge
-        if target_long and max(native_h, native_w) > target_long:
-            scale = target_long / max(native_h, native_w)
-            new_w = int(round(native_w * scale))
-            new_h = int(round(native_h * scale))
-            frames = [
-                cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                for f in frames
-            ]
-            frame_w, frame_h = new_w, new_h
+        # Frames arrive pre-resized to phase1_long_edge from extract_frames,
+        # so no second resize pass is needed here.
+        if frames:
+            frame_h, frame_w = frames[0].shape[:2]
         else:
-            frame_w, frame_h = native_w, native_h
+            frame_w, frame_h = frame_meta["width"], frame_meta["height"]
 
         per_frame_faces = []
         per_frame_yolo_persons = []

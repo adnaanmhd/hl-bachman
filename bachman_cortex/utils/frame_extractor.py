@@ -42,6 +42,7 @@ def extract_frames(
     fps: float = 1.0,
     max_frames: Optional[int] = None,
     motion_analyzer: Optional[_FrameProcessor] = None,
+    resize_long_edge: Optional[int] = None,
 ) -> tuple[list[np.ndarray], dict]:
     """Extract frames from a video at the specified sampling rate.
 
@@ -57,6 +58,9 @@ def extract_frames(
         motion_analyzer: Optional stateful consumer receiving the native-rate
             stream at its `frame_skip` cadence. Lets the motion check skip a
             second full-video decode.
+        resize_long_edge: If set, resize sampled frames so the long edge
+            equals this value (pixels). Motion analyzer still receives
+            full-resolution frames. Prevents OOM on long videos.
 
     Returns:
         Tuple of (frames, metadata) where:
@@ -111,13 +115,22 @@ def extract_frames(
             if need_sample or need_motion:
                 gpu_bgr = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGRA2BGR)
                 frame = gpu_bgr.download()
+                if resize_long_edge:
+                    fh, fw = frame.shape[:2]
+                    if max(fh, fw) > resize_long_edge:
+                        s = resize_long_edge / max(fh, fw)
+                        frame = cv2.resize(
+                            frame,
+                            (int(round(fw * s)), int(round(fh * s))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                if need_motion:
+                    motion_analyzer.process_frame(frame, frame_idx)
                 if need_sample:
                     frames.append(frame)
                     if max_frames and len(frames) >= max_frames:
                         sample_limit_reached = True
                     next_target += frame_interval
-                if need_motion:
-                    motion_analyzer.process_frame(frame, frame_idx)
 
             frame_idx += 1
             if sample_limit_reached and motion_skip == 0:
@@ -139,13 +152,22 @@ def extract_frames(
                 ret, frame = cap.retrieve()
                 if not ret:
                     break
+                if resize_long_edge:
+                    fh, fw = frame.shape[:2]
+                    if max(fh, fw) > resize_long_edge:
+                        s = resize_long_edge / max(fh, fw)
+                        frame = cv2.resize(
+                            frame,
+                            (int(round(fw * s)), int(round(fh * s))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                if need_motion:
+                    motion_analyzer.process_frame(frame, frame_idx)
                 if need_sample:
                     frames.append(frame)
                     if max_frames and len(frames) >= max_frames:
                         sample_limit_reached = True
                     next_target += frame_interval
-                if need_motion:
-                    motion_analyzer.process_frame(frame, frame_idx)
 
             frame_idx += 1
             if sample_limit_reached and motion_skip == 0:

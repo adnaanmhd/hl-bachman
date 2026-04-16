@@ -9,7 +9,7 @@ files are produced — the output is a timestamped report.
 | Check       | Acceptance Condition                           | How It Is Estimated              |
 | ----------- | ---------------------------------------------- | -------------------------------- |
 | Format      | MP4 container (MPEG-4)                         | Container metadata via FFprobe   |
-| Encoding    | H.264 video codec                              | Codec metadata via FFprobe       |
+| Encoding    | H.264 or HEVC (H.265) video codec              | Codec metadata via FFprobe       |
 | Resolution  | Displayed dims >= 1920 x 1080 (rotation applied)                    | Width & height metadata          |
 | Frame Rate  | >= 28 FPS                                                           | FPS metadata                     |
 | Duration    | >= 119 seconds                                                      | Duration metadata                |
@@ -65,7 +65,8 @@ available, else `cv2.VideoCapture`); at every native frame whose index
 is a multiple of `frame_skip = round(native_fps / target_fps)` the
 analyzer:
 
-1. Converts to grayscale and downsamples to ~540p (`fast_scale=0.5`).
+1. Converts to grayscale and downsamples by `fast_scale=0.5` (~360p
+   from 720p input).
 2. Tracks corner features frame-to-frame with sparse Lucas-Kanade (CUDA
    `cv2.cuda.SparsePyrLKOpticalFlow` when available; CPU fallback otherwise).
 3. Estimates an affine transform via RANSAC, yielding per-frame
@@ -202,11 +203,13 @@ results/run_NNN/
 
 ### Video Decode
 
-- **Single-pass decode:** Frame extraction and Phase 2 motion analysis
-  share one pass over the video. `frame_extractor.extract_frames` tees
-  the native-rate stream into a `MotionAnalyzer` (LK accumulator);
-  Phase 2's stability + frozen-segment check slices the pre-computed
-  per-second data without re-decoding.
+- **Single-pass decode:** Frame extraction, 720p downscale, and Phase 2
+  motion analysis share one pass over the video.
+  `frame_extractor.extract_frames` decodes each frame, resizes it to
+  720p long-edge, feeds the resized frame to a `MotionAnalyzer` (LK
+  accumulator), and appends it to the output list. Phase 2's stability +
+  frozen-segment check slices the pre-computed per-second data without
+  re-decoding.
 - **NVDEC hardware decode:** When the cv2 build has `cudacodec`,
   `extract_frames` uses `cv2.cudacodec.VideoReader` for GPU-side H.264
   decode. Frames are downloaded to CPU (BGR numpy) only at sample /
@@ -216,12 +219,13 @@ results/run_NNN/
 ### Phase 1
 
 - **No early stopping:** All frames are scanned to identify segment boundaries.
-- **720p long-edge downscale:** Each sampled frame is resized once at
-  the top of Phase 1 (`PipelineConfig.phase1_long_edge`, default 720).
-  YOLO / SCRFD / Hands23 all see the downscaled frames; bounding boxes
-  returned are in 720p coordinates and the Phase 2 segment dims are set
-  accordingly. Also caps the raw-frame cache held between Phase 1 and
-  Phase 2.
+- **720p long-edge downscale at extraction:** Each sampled frame is
+  resized to 720p long-edge during `extract_frames` before being stored
+  in memory (`resize_long_edge` parameter, default
+  `PipelineConfig.phase1_long_edge = 720`). Full-resolution frames never
+  accumulate — peak frame memory is N × 2.7 MB (720p) instead of
+  N × 6.2 MB (1080p). YOLO / SCRFD / Hands23 all see the downscaled
+  frames; bounding boxes are in 720p coordinates.
 - **Threaded SCRFD:** Face detection is dispatched across the batch via
   a `ThreadPoolExecutor` (`PipelineConfig.scrfd_threads`, default 4),
   overlapping with YOLO and Hands23 in the inner loop.

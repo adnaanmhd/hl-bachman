@@ -179,7 +179,11 @@ After patching, compiled with `python setup.py build develop --no-build-isolatio
 - **1 FPS** (300 frames from 5-min video) — baseline
 - Uniform temporal sampling via `cv2.VideoCapture` seeking at 1-second intervals
 - Configurable via `PipelineConfig.sampling_fps`
-- Sequential processing (bounded memory: ~5MB for current frame + model state)
+- Frames are resized to `phase1_long_edge` (default 720p) at extraction time
+  via `extract_frames(resize_long_edge=...)`. Each decoded frame is resized
+  before appending to the output list, so full-resolution frames never
+  accumulate in memory. Peak RAM for frames ≈ N × 2.7 MB (720p BGR) instead
+  of N × 6.2 MB (1080p BGR).
 
 ### Pipeline Architecture
 
@@ -188,11 +192,12 @@ Video file
   → Metadata checks (ffprobe, no frames needed)
   → IF metadata fails: return metadata results + SKIPPED for all others
   → Single-pass decode (NVDEC via cv2.cudacodec.VideoReader when available,
-    else cv2.VideoCapture) @ 1 FPS sampling. Native-rate stream tees into
-    a stateful MotionAnalyzer (LK optical flow accumulator) at its
-    frame_skip cadence (native_fps / target_fps, default target 30).
-  → Phase 1 downscale: each sampled frame resized to 720p long-edge once
-    (PipelineConfig.phase1_long_edge) — feeds all ML models in Phase 1.
+    else cv2.VideoCapture) @ 1 FPS sampling. Each decoded frame is resized
+    to 720p long-edge (PipelineConfig.phase1_long_edge) before being
+    appended to the output list — full-resolution frames never accumulate
+    in memory. The resized frame is also fed to a stateful MotionAnalyzer
+    (LK optical flow accumulator) at its frame_skip cadence
+    (native_fps / target_fps, default target 30).
   → Phase 1 ML batch loop:
       1. YOLO11s batched object detection (16-frame batches)
       2. SCRFD face detection dispatched across batch via ThreadPool
@@ -218,9 +223,11 @@ dataclass that accumulates per-second LK translation / rotation arrays
 plus per-sampled-frame frozen state as `frame_extractor.extract_frames`
 walks the video. The analyzer is created once in
 `ValidationProcessingPipeline.process_video` before extraction and passed
-to the extractor via the `motion_analyzer` kwarg. Extraction calls
+to the extractor via the `motion_analyzer` kwarg. Extraction resizes each
+decoded frame to 720p first, then calls
 `analyzer.process_frame(frame_bgr, frame_idx)` at the analyzer's
-`frame_skip` cadence.
+`frame_skip` cadence — the analyzer applies its own `fast_scale` (0.5×)
+on top, so LK runs at ~360p.
 
 Phase 2's motion check is `check_motion_combined_from_analyzer(analyzer,
 start_sec, end_sec, ...)` — it derives stability + frozen results from
@@ -404,7 +411,7 @@ tqdm>=4.65
 | Native FPS for frozen segments | 30 consecutive frames = 1 second; sampled frames would miss short freezes |
 | 1 FPS sampling for ML checks | 120 frames gives sufficient temporal coverage; configurable for GPU |
 | Single-pass decode (2026-04-13) | Phase 1 extraction and Phase 2 motion analysis share one cv2 read pass. MotionAnalyzer accumulates per-second LK trans/rot inline; Phase 2 slices without re-decoding. Cuts LATAM 501s video 133s → 116s default config. |
-| Phase 1 720p downscale (2026-04-13) | Feeds YOLO / SCRFD / Hands23 with ~2.3× fewer pixels than native 1080p. Frame cache also capped at 720p — halves Phase 1 peak memory. |
+| Phase 1 720p downscale (2026-04-13, moved to extraction 2026-04-16) | Frames resized to 720p long-edge at decode time inside `extract_frames(resize_long_edge=...)`. Previously a separate pass in `_phase1_run_inference` that created a second list while the 1080p originals were still alive — caused OOM on videos longer than ~30 min (dual 1080p + 720p lists exceeded 16 GB RAM). Now only 720p frames exist in memory at any point. MotionAnalyzer also receives 720p input (applies its own 0.5× downscale to 360p for LK). |
 | Threaded SCRFD (2026-04-13) | `FaceAnalysis.get()` isn't batch-capable and releases the GIL inside ORT `run()`. 4-worker ThreadPoolExecutor overlaps SCRFD with YOLO / Hands23 in the inner loop (~1.2× Phase 1 win). |
 | cuDNN HEURISTIC on SCRFD (2026-04-13) | ORT defaults to `cudnn_conv_algo_search=EXHAUSTIVE` which adds 2-3s to first inference per new input shape. HEURISTIC smoothes p99 at negligible throughput cost. |
 | Custom OpenCV-CUDA build (2026-04-13) | PyPI cv2 has no CUDA. Building from source unlocks `cv2.cuda.SparsePyrLKOpticalFlow` (GPU motion) and `cv2.cudacodec.VideoReader` (NVDEC decode). Drops LATAM 501s video extraction 46.6s → 32.8s. Cost: ~60 min one-time build via scripts/install_opencv_cuda.sh. |
