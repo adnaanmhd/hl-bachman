@@ -137,7 +137,7 @@ Each checkable segment is validated against remaining checks. Binary pass/fail â
 | Check | Model | Acceptance Condition |
 |---|---|---|
 | Luminance & Blur | Tenengrad | >= 70% good frames + stable brightness |
-| Camera Stability | LK optical flow at 0.5x (GPU when available) | Shakiness score <= 0.50 |
+| Camera Stability | LK optical flow at 0.5x, high-pass jitter filter (GPU when available) | Jitter score <= 0.181 |
 | Frozen Segments | LK signal | No > 30 consecutive frozen frames |
 | Hand Visibility | Hands23 | Both hands in frame in >= 80% frames **OR** at least one hand in frame in >= 90% frames (bbox > 0px from edge) |
 | Hand-Object Interaction | Hands23 | Contact with portable/stationary object in >= 60% frames |
@@ -280,6 +280,8 @@ CPU LK are the fallback paths.
 - **Single-pass camera stability:** LK optical flow at 0.5Ã— resolution,
   per-frame at 30 FPS target. CUDA GPU acceleration
   (`cv2.cuda.SparsePyrLKOpticalFlow`) when the OpenCV build has CUDA.
+  A high-pass jitter filter (0.5s rolling-mean residual) separates
+  intentional camera movement from shake before scoring.
 - **Frozen detection from LK signal:** Near-zero translation + rotation = frozen. Zero marginal cost on top of stability analysis.
 
 ### Batch Processing

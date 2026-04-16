@@ -107,6 +107,23 @@ def _lk_track(
     return curr_pts, status.reshape(-1)
 
 
+def _highpass_signal(values: np.ndarray, window: int) -> np.ndarray:
+    """Remove low-frequency component, isolating high-frequency jitter.
+
+    Uses a variable-width rolling mean so edge frames are not distorted by
+    zero-padding.  Returns ``|values - rolling_mean|``.
+    """
+    n = len(values)
+    if n <= window or window < 2:
+        return values
+    cs = np.cumsum(np.concatenate(([0.0], values.astype(np.float64))))
+    half = window // 2
+    lo = np.clip(np.arange(n) - half, 0, n)
+    hi = np.clip(np.arange(n) + half + 1, 0, n)
+    low_freq = (cs[hi] - cs[lo]) / (hi - lo)
+    return np.abs(values - low_freq)
+
+
 def _transforms_to_score(
     translations: list[float],
     rotations: list[float],
@@ -576,6 +593,8 @@ def check_motion_combined(
     lk_win_size: tuple[int, int] = (21, 21),
     lk_max_level: int = 3,
     stability_target_fps: float = 30.0,
+    # High-pass filter: isolate jitter from intentional camera motion
+    highpass_window_sec: float = 0.5,
     # Frozen params (derived from LK signal — no separate SSIM pass)
     frozen_max_consecutive: int = 30,
     frozen_trans_threshold: float = 0.1,
@@ -587,9 +606,10 @@ def check_motion_combined(
     """Single-pass motion analysis: camera stability + frozen segment detection.
 
     Single pass at 0.5x resolution with per-frame LK optical flow (every
-    frame at target_fps).  Frozen detection derived from the same LK signal
-    (near-zero translation + rotation = frozen).  CUDA GPU acceleration
-    used when available.
+    frame at target_fps).  A high-pass filter separates intentional camera
+    movement from jitter before scoring.  Frozen detection derived from the
+    same LK signal (near-zero translation + rotation = frozen).  CUDA GPU
+    acceleration used when available.
 
     Returns:
         (stability_result, frozen_result)
@@ -628,8 +648,9 @@ def check_motion_combined(
     )
     inv_scale = 1.0 / fast_scale if fast_scale != 1.0 else 1.0
 
-    # --- Stability state ---
-    per_sec_scores: dict[int, float] = {}
+    # --- Stability state (raw per-second data; filtered + scored after pass) ---
+    per_sec_raw_trans: dict[int, list[float]] = {}
+    per_sec_raw_rots: dict[int, list[float]] = {}
     lk_prev_gray = None
     lk_prev_pts = None
     lk_trans: list[float] = []
@@ -674,11 +695,10 @@ def check_motion_combined(
                 gray = cv2.resize(gray, (0, 0), fx=fast_scale, fy=fast_scale)
 
             if sec != cur_sec:
-                # Score previous second
+                # Store previous second's raw data
                 if cur_sec >= 0:
-                    score, _ = _transforms_to_score(
-                        lk_trans, lk_rots, scale=inv_scale, **score_kw)
-                    per_sec_scores[cur_sec] = score
+                    per_sec_raw_trans[cur_sec] = lk_trans
+                    per_sec_raw_rots[cur_sec] = lk_rots
                     frame_count += len(lk_trans) + 1
 
                 cur_sec = sec
@@ -737,12 +757,37 @@ def check_motion_combined(
 
                 lk_prev_gray = gray
 
-    # Score last second
+    # Store last second's raw data
     if cur_sec >= 0:
-        score, _ = _transforms_to_score(
-            lk_trans, lk_rots, scale=inv_scale, **score_kw)
-        per_sec_scores[cur_sec] = score
+        per_sec_raw_trans[cur_sec] = lk_trans
+        per_sec_raw_rots[cur_sec] = lk_rots
         frame_count += len(lk_trans) + 1
+
+    # --- High-pass filter full timeseries, then score per-second ---
+    hp_window = max(1, int(round(highpass_window_sec * stability_target_fps)))
+    all_trans: list[float] = []
+    all_rots: list[float] = []
+    sec_order: list[int] = []
+    sec_counts: list[int] = []
+    for sec in sorted(per_sec_raw_trans):
+        t = per_sec_raw_trans[sec]
+        all_trans.extend(t)
+        all_rots.extend(per_sec_raw_rots[sec])
+        sec_order.append(sec)
+        sec_counts.append(len(t))
+
+    per_sec_scores: dict[int, float] = {}
+    if all_trans:
+        filtered_trans = _highpass_signal(np.array(all_trans), hp_window)
+        filtered_rots = _highpass_signal(np.array(all_rots), hp_window)
+        idx = 0
+        for sec, count in zip(sec_order, sec_counts):
+            sec_t = filtered_trans[idx:idx + count].tolist()
+            sec_r = filtered_rots[idx:idx + count].tolist()
+            score, _ = _transforms_to_score(
+                sec_t, sec_r, scale=inv_scale, **score_kw)
+            per_sec_scores[sec] = score
+            idx += count
 
     # Finalize frozen run at end
     if frozen_run > 0:
@@ -773,6 +818,7 @@ def check_motion_combined(
             "total_seconds": int(total_seconds),
             "frames_analysed": frame_count,
             "fast_scale": fast_scale,
+            "highpass_window_sec": highpass_window_sec,
             "native_fps": round(native_fps, 2),
             "target_fps": stability_target_fps,
             "fps_skip": stab_fps_skip,
@@ -930,12 +976,14 @@ def check_motion_combined_from_analyzer(
     frozen_max_consecutive: int = 30,
     frozen_trans_threshold: float = 0.1,
     frozen_rot_threshold: float = 0.001,
+    highpass_window_sec: float = 0.5,
 ) -> tuple[CheckResult, CheckResult]:
     """Derive segment stability + frozen results from a pre-populated analyzer.
 
     Replaces `check_motion_combined`'s per-segment video re-open. Uses the
     per-second trans/rot arrays and the sampled-frame sequence already
-    collected during single-pass decode.
+    collected during single-pass decode.  A high-pass filter separates
+    intentional camera movement from jitter before scoring.
     """
     native_fps = analyzer.native_fps
     inv_scale = 1.0 / analyzer.fast_scale if analyzer.fast_scale != 1.0 else 1.0
@@ -951,18 +999,38 @@ def check_motion_combined_from_analyzer(
         w_trans=w_trans, w_var=w_var, w_rot=w_rot, w_jump=w_jump,
     )
 
-    per_sec_scores: dict[int, float] = {}
+    # Concatenate translations/rotations across all seconds in range,
+    # apply high-pass filter to isolate jitter, then re-split and score.
+    hp_window = max(1, int(round(highpass_window_sec * (native_fps / eff_skip))))
+    all_trans: list[float] = []
+    all_rots: list[float] = []
+    sec_order: list[int] = []
+    sec_counts: list[int] = []
     frame_count = 0
     for sec in range(sec_start, sec_end):
         trans = analyzer.per_second_trans.get(sec, [])
         rots = analyzer.per_second_rot.get(sec, [])
         if not trans:
             continue
-        score, _ = _transforms_to_score(
-            trans, rots, scale=inv_scale, **score_kw,
-        )
-        per_sec_scores[sec] = score
+        all_trans.extend(trans)
+        all_rots.extend(rots)
+        sec_order.append(sec)
+        sec_counts.append(len(trans))
         frame_count += len(trans) + 1
+
+    per_sec_scores: dict[int, float] = {}
+    if all_trans:
+        filtered_trans = _highpass_signal(np.array(all_trans), hp_window)
+        filtered_rots = _highpass_signal(np.array(all_rots), hp_window)
+        idx = 0
+        for sec, count in zip(sec_order, sec_counts):
+            sec_t = filtered_trans[idx:idx + count].tolist()
+            sec_r = filtered_rots[idx:idx + count].tolist()
+            score, _ = _transforms_to_score(
+                sec_t, sec_r, scale=inv_scale, **score_kw,
+            )
+            per_sec_scores[sec] = score
+            idx += count
 
     shaky_secs = [s for s, sc in per_sec_scores.items()
                   if sc >= shaky_score_threshold]
@@ -981,6 +1049,7 @@ def check_motion_combined_from_analyzer(
             "total_seconds": int(total_seconds),
             "frames_analysed": frame_count,
             "fast_scale": analyzer.fast_scale,
+            "highpass_window_sec": highpass_window_sec,
             "native_fps": round(native_fps, 2),
             "target_fps": analyzer.target_fps,
             "effective_skip": eff_skip,

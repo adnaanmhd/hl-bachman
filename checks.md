@@ -48,7 +48,7 @@ labeled **USABLE** in the timeline; segments that fail any check are labeled
 | Check                   | Acceptance Condition                                                                          | Model / Method                                  |
 | ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
 | Luminance & Blur        | (accept + review) frames >= 70% AND brightness std dev <= 60                                  | Tenengrad sharpness + luminance zones           |
-| Camera Stability        | LK shakiness score <= 0.50                                                                    | Sparse Lucas-Kanade optical flow at 0.5x (GPU when available)   |
+| Camera Stability        | High-pass filtered LK jitter score <= 0.181                                                   | Sparse Lucas-Kanade optical flow at 0.5x, high-pass filtered (GPU when available) |
 | Frozen Segments         | No > 30 consecutive frames with near-zero LK motion (trans < 0.1px, rot < 0.001°)             | LK optical flow signal (zero marginal cost)     |
 | Hand Visibility         | >= 80% frames with both hands fully in frame **OR** >= 90% frames with at least one hand fully in frame (bbox > 0 px from every edge, confidence >= 0.7) | Hands23 detection + bbox edge clearance         |
 | Hand-Object Interaction | Hand contact with portable or stationary object in >= 60% frames                              | Hands23 contact state                           |
@@ -56,7 +56,7 @@ labeled **USABLE** in the timeline; segments that fail any check are labeled
 | POV-Hand Angle          | Hand angle from frame center < 40° in >= 60% frames                                           | Hand bbox center vs frame center                |
 | Face Presence (strict)  | Zero sampled frames in the segment contain a face with confidence >= 0.8                       | SCRFD-2.5GF (detections reused from Phase 1 cache) |
 
-### Camera Stability — Single-Pass LK
+### Camera Stability — Single-Pass LK with High-Pass Jitter Filter
 
 LK optical flow is computed **inline with frame extraction** by a
 stateful `MotionAnalyzer` (`bachman_cortex/checks/motion_analysis.py`).
@@ -73,9 +73,16 @@ analyzer:
    translation (px) and rotation (degrees).
 
 Phase 2's stability + frozen-segment check then slices the segment's range
-from the analyzer (no `cv2.VideoCapture.set()` seek, no re-decode) and
-combines per-second translation / rotation into a shakiness score using
-weighted components:
+from the analyzer (no `cv2.VideoCapture.set()` seek, no re-decode).
+
+**High-pass jitter filter:** Before scoring, the full per-frame translation
+and rotation timeseries are high-pass filtered to separate intentional camera
+movement (smooth pans, head turns) from unwanted jitter (shake, vibration).
+A rolling mean over a configurable window (default 0.5s = 15 frames at 30 FPS)
+approximates the intended motion; the absolute residual is the jitter signal.
+Only the jitter is scored.
+
+Per-second jitter scores are computed using weighted components:
 
 | Component              | Weight | Normalisation                     |
 | ---------------------- | ------ | --------------------------------- |
@@ -88,7 +95,7 @@ All component scores are clamped to [0, 1]; the weighted sum produces a
 per-second score in [0, 1].
 
 **Final verdict:** The overall score is the mean of all per-second scores.
-The segment passes if overall score <= `shaky_score_threshold` (default 0.50).
+The segment passes if overall score <= `shaky_score_threshold` (default 0.181).
 
 CUDA GPU acceleration is used automatically when OpenCV is built with CUDA
 support (`cv2.cuda.SparsePyrLKOpticalFlow`), with transparent CPU fallback.

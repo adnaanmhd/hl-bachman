@@ -91,7 +91,7 @@ class PipelineConfig:
     max_brightness_std: float = 60.0
 
     # Camera stability (single-pass LK optical flow at 0.5x)
-    shaky_score_threshold: float = 0.50
+    shaky_score_threshold: float = 0.181
     fast_scale: float = 0.5
     stability_trans_threshold: float = 8.0
     stability_jump_threshold: float = 30.0
@@ -105,6 +105,7 @@ class PipelineConfig:
     stability_lk_win_size: tuple[int, int] = (21, 21)
     stability_lk_max_level: int = 3
     stability_target_fps: float = 30.0
+    highpass_window_sec: float = 0.5
 
     # Frozen segments
     frozen_max_consecutive: int = 30
@@ -635,6 +636,7 @@ class ValidationProcessingPipeline:
                 frozen_max_consecutive=self.config.frozen_max_consecutive,
                 frozen_trans_threshold=self.config.frozen_trans_threshold,
                 frozen_rot_threshold=self.config.frozen_rot_threshold,
+                highpass_window_sec=self.config.highpass_window_sec,
             )
 
         motion_future = motion_executor.submit(_run_motion)

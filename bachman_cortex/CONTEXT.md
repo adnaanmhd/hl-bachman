@@ -17,7 +17,7 @@ The pipeline validates 5 categories of checks across 21 total criteria:
 1. **Video Metadata** (6 checks) — format, encoding, resolution, frame rate, duration, orientation. Acts as a gate: failure skips all other checks.
 2. **Frame-Level Quality** (3 checks) — average brightness, brightness stability, near-black frames.
 3. **Luminance & Blur** (1 check) — per-frame Tenengrad/luminance classification with segment-level aggregation.
-4. **Motion Analysis** (2 checks) — camera stability via single-pass LK optical flow at 0.5x (GPU-accelerated when CUDA OpenCV available). LK is computed inline with frame extraction by a stateful `MotionAnalyzer`; Phase 2 stability + frozen-segment checks slice results from the analyzer without re-decoding the video. Frozen segments derived from LK signal (near-zero translation + rotation).
+4. **Motion Analysis** (2 checks) — camera stability via single-pass LK optical flow at 0.5x (GPU-accelerated when CUDA OpenCV available). LK is computed inline with frame extraction by a stateful `MotionAnalyzer`; Phase 2 stability + frozen-segment checks slice results from the analyzer without re-decoding the video. A high-pass jitter filter (0.5s rolling-mean residual) separates intentional camera movement from shake before scoring. Frozen segments derived from LK signal (near-zero translation + rotation).
 5. **ML Detection** (6 checks) — face presence (Phase 1 per-frame gate + Phase 2 strict segment check), participants, hand visibility, hand-object interaction, view obstruction, POV-hand angle.
 
 See [checks.md](../checks.md) for full acceptance conditions and thresholds.
@@ -216,7 +216,7 @@ Video file
   → Phase 3 yield calculation
 ```
 
-### MotionAnalyzer (single-pass LK, 2026-04-13)
+### MotionAnalyzer (single-pass LK, 2026-04-13; high-pass jitter filter, 2026-04-16)
 
 `bachman_cortex/checks/motion_analysis.py` defines a `MotionAnalyzer`
 dataclass that accumulates per-second LK translation / rotation arrays
@@ -231,9 +231,14 @@ on top, so LK runs at ~360p.
 
 Phase 2's motion check is `check_motion_combined_from_analyzer(analyzer,
 start_sec, end_sec, ...)` — it derives stability + frozen results from
-the pre-populated analyzer, no `cv2.VideoCapture` re-open. LK numerical
-path is identical to the original `check_motion_combined` (same
-`_lk_track`, same `_transforms_to_score` scoring).
+the pre-populated analyzer, no `cv2.VideoCapture` re-open. Before
+scoring, the full translation and rotation timeseries for the segment
+are high-pass filtered (`_highpass_signal`) to isolate jitter from
+intentional camera movement (head turns, pans). A rolling mean over
+`highpass_window_sec` (default 0.5s) approximates the intended motion;
+the absolute residual is the jitter signal passed to
+`_transforms_to_score`. This prevents smooth deliberate movement from
+inflating the shakiness score. Default pass threshold is 0.181.
 
 Replaces the prior design where Phase 1 did a full decode and Phase 2
 re-decoded each segment's range on CPU. Observed impact on a 501 s /
@@ -412,6 +417,7 @@ tqdm>=4.65
 | 1 FPS sampling for ML checks | 120 frames gives sufficient temporal coverage; configurable for GPU |
 | Single-pass decode (2026-04-13) | Phase 1 extraction and Phase 2 motion analysis share one cv2 read pass. MotionAnalyzer accumulates per-second LK trans/rot inline; Phase 2 slices without re-decoding. Cuts LATAM 501s video 133s → 116s default config. |
 | Phase 1 720p downscale (2026-04-13, moved to extraction 2026-04-16) | Frames resized to 720p long-edge at decode time inside `extract_frames(resize_long_edge=...)`. Previously a separate pass in `_phase1_run_inference` that created a second list while the 1080p originals were still alive — caused OOM on videos longer than ~30 min (dual 1080p + 720p lists exceeded 16 GB RAM). Now only 720p frames exist in memory at any point. MotionAnalyzer also receives 720p input (applies its own 0.5× downscale to 360p for LK). |
+| High-pass jitter filter for camera stability (2026-04-16) | Raw LK translation/rotation includes both intentional movement (head turns, pans) and unwanted shake. Two videos with similar overall motion but different shake levels scored nearly identically (0.374 vs 0.391). A high-pass filter (0.5s rolling-mean subtraction via `_highpass_signal`) isolates jitter from deliberate motion before scoring. After filtering, the non-shaky video dropped to 0.166 while the shaky video stayed at 0.184 — clear separation. Threshold lowered from 0.50 to 0.181. Negligible compute cost (NumPy on a 1D array already in memory). |
 | Threaded SCRFD (2026-04-13) | `FaceAnalysis.get()` isn't batch-capable and releases the GIL inside ORT `run()`. 4-worker ThreadPoolExecutor overlaps SCRFD with YOLO / Hands23 in the inner loop (~1.2× Phase 1 win). |
 | cuDNN HEURISTIC on SCRFD (2026-04-13) | ORT defaults to `cudnn_conv_algo_search=EXHAUSTIVE` which adds 2-3s to first inference per new input shape. HEURISTIC smoothes p99 at negligible throughput cost. |
 | Custom OpenCV-CUDA build (2026-04-13) | PyPI cv2 has no CUDA. Building from source unlocks `cv2.cuda.SparsePyrLKOpticalFlow` (GPU motion) and `cv2.cudacodec.VideoReader` (NVDEC decode). Drops LATAM 501s video extraction 46.6s → 32.8s. Cost: ~60 min one-time build via scripts/install_opencv_cuda.sh. |
