@@ -8,13 +8,13 @@
 - Lowercase with underscores (snake_case): `hand_visibility.py`, `frame_extractor.py`, `motion_analysis.py`
 - Model files follow detector type names: `scrfd_detector.py`, `yolo_detector.py`, `hand_detector.py`
 - Utility modules in `bachman_cortex/utils/`: `frame_extractor.py`, `early_stop.py`, `segment_ops.py`, `transcode.py`, `video_metadata.py`
-- Check modules in `bachman_cortex/checks/`: `hand_visibility.py`, `luminance_blur.py`, `motion_analysis.py`, `face_presence.py`, `hand_object_interaction.py`, `view_obstruction.py`, `pov_hand_angle.py`, `participants.py`, `video_metadata.py`
+- Check modules in `bachman_cortex/checks/`: `hand_visibility.py`, `luminance.py`, `pixelation.py`, `motion_analysis.py`, `face_presence.py`, `hand_object_interaction.py`, `view_obstruction.py`, `pov_hand_angle.py`, `participants.py`, `video_metadata.py`
 - Test files in `bachman_cortex/tests/`: `benchmark_models.py`, `benchmark_phase_correlation.py`, `generate_test_video.py`
 
 **Functions:**
 - Snake_case: `check_hand_visibility()`, `extract_frames()`, `_hand_in_frame()` (private prefix with single underscore)
 - Helper functions prefixed with underscore: `_compute_frame_metrics()`, `_transforms_to_score()`, `_lk_track()`, `_feature_params()`, `_phase_corr_score()`
-- Check functions follow pattern: `check_<criterion_name>()` — examples: `check_hand_visibility()`, `check_face_presence()`, `check_luminance_blur()`, `check_motion_combined_from_analyzer()`, `check_hand_object_interaction()`
+- Check functions follow pattern: `check_<criterion_name>()` — examples: `check_hand_visibility()`, `check_face_presence()`, `check_luminance()`, `check_pixelation()`, `check_motion_combined_from_analyzer()`, `check_hand_object_interaction()`
 
 **Variables:**
 - Snake_case: `per_frame_hands`, `total_frames`, `frame_h`, `frame_w`, `confidence_threshold`, `both_hands_pass_rate`
@@ -22,7 +22,7 @@
 - Loop variables: `for frame in frames`, `for hands in per_frame_hands`, `for h in hands`
 
 **Types/Classes:**
-- PascalCase for classes: `CheckResult`, `HandDetection`, `FaceDetection`, `ObjectDetection`, `FrameMetrics`, `FrameLabel`, `TimeSegment`, `CheckableSegment`, `SegmentValidationResult`, `VideoProcessingResult`, `PipelineConfig`, `ValidationProcessingPipeline`, `LuminanceBlurConfig`, `ContactState`, `HandSide`, `MotionAnalyzer`
+- PascalCase for classes: `CheckResult`, `HandDetection`, `FaceDetection`, `ObjectDetection`, `FrameMetrics`, `FrameLabel`, `TimeSegment`, `CheckableSegment`, `SegmentValidationResult`, `VideoProcessingResult`, `PipelineConfig`, `ValidationProcessingPipeline`, `LuminanceConfig`, `PixelationConfig`, `ContactState`, `HandSide`, `MotionAnalyzer`
 - Enum members: UPPERCASE (e.g., `ContactState.NO_CONTACT`, `HandSide.LEFT`, `HandSide.RIGHT`)
 - Dataclass fields: Snake_case with type hints
 - Config parameter names: Snake_case with descriptive suffixes (e.g., `confidence_threshold`, `pass_rate`, `frame_margin`)
@@ -188,7 +188,7 @@ from bachman_cortex.pipeline import ValidationProcessingPipeline, PipelineConfig
 
 **Heavy use of dataclasses:**
 - `@dataclass` decorator for all data structures
-- Examples: `CheckResult`, `HandDetection`, `FaceDetection`, `FrameMetrics`, `TimeSegment`, `CheckableSegment`, `FrameLabel`, `CheckFrameResults`, `SegmentValidationResult`, `VideoProcessingResult`, `PipelineConfig`, `LuminanceBlurConfig`
+- Examples: `CheckResult`, `HandDetection`, `FaceDetection`, `FrameMetrics`, `TimeSegment`, `CheckableSegment`, `FrameLabel`, `CheckFrameResults`, `SegmentValidationResult`, `VideoProcessingResult`, `PipelineConfig`, `LuminanceConfig`, `PixelationConfig`
 - Fields have type hints and optional defaults
 - Example:
   ```python

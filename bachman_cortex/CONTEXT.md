@@ -16,7 +16,8 @@ Humyn Labs is building an egocentric video dataset for **training autonomous hum
 The pipeline validates 5 categories of checks across 21 total criteria:
 1. **Video Metadata** (6 checks) — format, encoding, resolution, frame rate, duration, orientation. Acts as a gate: failure skips all other checks.
 2. **Frame-Level Quality** (3 checks) — average brightness, brightness stability, near-black frames.
-3. **Luminance & Blur** (1 check) — per-frame Tenengrad/luminance classification with segment-level aggregation.
+3. **Luminance** (1 check) — per-frame luminance zone classification (dead black / too dark / blown out) with brightness flicker detection.
+3b. **Pixelation** (1 check) — block boundary gradient ratio detecting compression artifacts and upscaled low-res sources.
 4. **Motion Analysis** (2 checks) — camera stability via single-pass LK optical flow at 0.5x (GPU-accelerated when CUDA OpenCV available). LK is computed inline with frame extraction by a stateful `MotionAnalyzer`; Phase 2 stability + frozen-segment checks slice results from the analyzer without re-decoding the video. A high-pass jitter filter (0.5s rolling-mean residual) separates intentional camera movement from shake before scoring. Frozen segments derived from LK signal (near-zero translation + rotation).
 5. **ML Detection** (6 checks) — face presence (Phase 1 per-frame gate + Phase 2 strict segment check), participants, hand visibility, hand-object interaction, view obstruction, POV-hand angle.
 
@@ -206,7 +207,8 @@ Video file
   → Phase 1 evaluation: face + participant per-frame pass/fail →
     bad segments → overlap merge → good segments → filter by min duration
   → Checkable segments → Phase 2 per-segment validation:
-      - Luminance & blur (Tenengrad + luminance decision table)
+      - Luminance (dark/bright zone classification + flicker detection)
+      - Pixelation (block boundary gradient ratio)
       - View obstruction heuristic
       - Hand visibility / hand-object interaction / POV-hand angle
         (reused from Phase 1 cache)
@@ -334,7 +336,8 @@ hl-bachman/
     ├── checks/
     │   ├── check_results.py            # CheckResult dataclass
     │   ├── video_metadata.py           # 6 metadata checks
-    │   ├── luminance_blur.py           # Tenengrad + luminance decision table
+    │   ├── luminance.py                # Luminance zones + flicker detection
+    │   ├── pixelation.py              # Block boundary gradient ratio
     │   ├── motion_analysis.py          # MotionAnalyzer (single-pass LK) + slicer
     │   ├── participants.py             # Person count check
     │   ├── hand_visibility.py          # Hand detection check

@@ -73,7 +73,7 @@ def _segment_accepted_observed(name: str, r: CheckResult) -> tuple[str, str]:
     d = r.details or {}
     metric = r.metric_value
 
-    if name == "luminance_blur":
+    if name == "luminance":
         threshold = d.get("min_good_ratio", "?")
         return f">={_fmt_pct(threshold)}", _fmt_pct(metric)
     elif name == "ml_hand_visibility":
@@ -361,14 +361,6 @@ _REVIEW_CHECK_SPECS: list[tuple[str, list[tuple[str, str, int]]]] = [
     ("ml_face_presence", [("Conf (mean / min / max)", "confidence", 2)]),
     ("ml_hand_visibility", [("Conf (mean / min / max)", "confidence", 2)]),
     ("ml_hand_object_interaction", [("Conf (mean / min / max)", "confidence", 2)]),
-    (
-        "luminance_blur",
-        [
-            ("Mean Luminance (mean / min / max)", "mean_luminance", 2),
-            ("Norm. Tenengrad (mean / min / max)", "tenengrad_norm", 4),
-            ("Raw Tenengrad (mean / min / max)", "tenengrad_raw", 2),
-        ],
-    ),
 ]
 
 

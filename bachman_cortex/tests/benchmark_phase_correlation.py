@@ -21,7 +21,6 @@ sys.path.insert(0, ROOT)
 
 from bachman_cortex.checks.check_results import CheckResult
 from bachman_cortex.checks.motion_analysis import (
-    check_camera_stability,
     check_frozen_segments,
 )
 
@@ -407,27 +406,20 @@ def main():
     print(f"Duration:   {dur:.1f}s ({total} frames)")
     print()
 
-    # ── Existing LK + SSIM checks ──────────────────────────────────────────
+    # ── SSIM frozen segments ─────────────────────────────────────────────────
     print("-" * 70)
-    print("EXISTING METHOD: Lucas-Kanade + SSIM")
+    print("EXISTING METHOD: SSIM Frozen Detection")
     print("-" * 70)
-
-    t0 = time.perf_counter()
-    lk_stability = check_camera_stability(video_path)
-    t_lk_stab = time.perf_counter() - t0
-    _print_result("Camera Stability (LK)", lk_stability, t_lk_stab)
 
     t0 = time.perf_counter()
     ssim_frozen = check_frozen_segments(video_path)
     t_ssim_frozen = time.perf_counter() - t0
     _print_result("Frozen Segments (SSIM)", ssim_frozen, t_ssim_frozen)
 
-    total_existing = t_lk_stab + t_ssim_frozen
-
-    # ── New phase-correlation checks ────────────────────────────────────────
+    # ── Phase-correlation checks ───────────────────────────────────────────
     print()
     print("-" * 70)
-    print("NEW METHOD: Phase Correlation")
+    print("Phase Correlation")
     print("-" * 70)
 
     t0 = time.perf_counter()
@@ -440,40 +432,20 @@ def main():
     t_pc_frozen = time.perf_counter() - t0
     _print_result("Frozen Segments (PhaseCorr)", pc_frozen, t_pc_frozen)
 
-    total_new = t_pc_stab + t_pc_frozen
-
     # ── Comparison summary ──────────────────────────────────────────────────
     print()
     print("=" * 70)
     print("COMPARISON SUMMARY")
     print("=" * 70)
 
-    print(f"\n{'Check':<30} {'LK+SSIM':>10} {'PhaseCorr':>10} {'Speedup':>10}")
-    print("-" * 62)
-    speedup_stab = t_lk_stab / t_pc_stab if t_pc_stab > 0 else float("inf")
     speedup_frozen = t_ssim_frozen / t_pc_frozen if t_pc_frozen > 0 else float("inf")
-    speedup_total = total_existing / total_new if total_new > 0 else float("inf")
-
-    print(f"{'Camera Stability':<30} {t_lk_stab:>9.2f}s {t_pc_stab:>9.2f}s {speedup_stab:>9.1f}x")
+    print(f"\n{'Check':<30} {'SSIM':>10} {'PhaseCorr':>10} {'Speedup':>10}")
+    print("-" * 62)
     print(f"{'Frozen Detection':<30} {t_ssim_frozen:>9.2f}s {t_pc_frozen:>9.2f}s {speedup_frozen:>9.1f}x")
-    print(f"{'TOTAL':<30} {total_existing:>9.2f}s {total_new:>9.2f}s {speedup_total:>9.1f}x")
 
-    print(f"\n{'Result Agreement':}")
-    print(f"  Stability: LK={lk_stability.status} (score={lk_stability.metric_value}) "
-          f"vs PC={pc_stability.status} (score={pc_stability.metric_value})")
-    print(f"  Frozen:    SSIM={ssim_frozen.status} (metric={ssim_frozen.metric_value}) "
-          f"vs PC={pc_frozen.status} (metric={pc_frozen.metric_value})")
-
-    lk_shaky = set(lk_stability.details.get("shaky_seconds", []))
-    pc_shaky = set(pc_stability.details.get("shaky_seconds", []))
-    if lk_shaky or pc_shaky:
-        overlap = lk_shaky & pc_shaky
-        print(f"\n  Shaky seconds overlap: {len(overlap)} common out of "
-              f"LK={len(lk_shaky)}, PC={len(pc_shaky)}")
-
-    lk_frozen_segs = ssim_frozen.details.get("frozen_segments", []) if ssim_frozen.details else []
     pc_frozen_segs = pc_frozen.details.get("frozen_segments", []) if pc_frozen.details else []
-    print(f"  Frozen segments: SSIM found {len(lk_frozen_segs)}, "
+    ssim_frozen_segs = ssim_frozen.details.get("frozen_segments", []) if ssim_frozen.details else []
+    print(f"\n  Frozen segments: SSIM found {len(ssim_frozen_segs)}, "
           f"PC found {len(pc_frozen_segs)}")
 
     print()

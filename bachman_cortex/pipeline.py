@@ -28,7 +28,7 @@ from bachman_cortex.data_types import (
 )
 from bachman_cortex.utils.video_metadata import get_video_metadata
 from bachman_cortex.checks.video_metadata import run_all_metadata_checks
-from bachman_cortex.checks.luminance_blur import check_luminance_blur, LuminanceBlurConfig
+from bachman_cortex.checks.luminance import check_luminance, LuminanceConfig
 from bachman_cortex.checks.motion_analysis import (
     MotionAnalyzer,
     check_motion_combined_from_analyzer,
@@ -87,9 +87,6 @@ class PipelineConfig:
     # Opt-in preprocessing: lossless HEVC → H.264 conversion before Phase 0.
     transcode_hevc: bool = False
 
-    # Brightness stability threshold
-    max_brightness_std: float = 60.0
-
     # Camera stability (single-pass LK optical flow at 0.5x)
     shaky_score_threshold: float = 0.181
     fast_scale: float = 0.5
@@ -112,8 +109,10 @@ class PipelineConfig:
     frozen_trans_threshold: float = 0.1
     frozen_rot_threshold: float = 0.001
 
-    # Luminance & blur
-    luminance_blur_min_good_ratio: float = 0.70
+    # Luminance
+    luminance_min_good_ratio: float = 0.80
+    flicker_window: int = 10
+    flicker_std_threshold: float = 30.0
 
     # Hands23 input resolution cap
     hands23_max_resolution: int | None = 720
@@ -641,13 +640,14 @@ class ValidationProcessingPipeline:
 
         motion_future = motion_executor.submit(_run_motion)
 
-        # Luminance & blur
-        lb_config = LuminanceBlurConfig(
-            min_good_ratio=self.config.luminance_blur_min_good_ratio,
-            max_brightness_std=self.config.max_brightness_std,
+        # Luminance
+        lum_config = LuminanceConfig(
+            min_good_ratio=self.config.luminance_min_good_ratio,
+            flicker_window=self.config.flicker_window,
+            flicker_std_threshold=self.config.flicker_std_threshold,
         )
-        check_results["luminance_blur"] = check_luminance_blur(
-            seg_frames, config=lb_config, timestamps=seg_timestamps,
+        check_results["luminance"] = check_luminance(
+            seg_frames, config=lum_config, timestamps=seg_timestamps,
         )
 
         # Hand visibility: both-hands >=80% OR single-hand >=90%

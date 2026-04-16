@@ -21,7 +21,8 @@ hl-bachman/
 │   │   ├── face_presence.py     # Phase 2 check: strict face detection
 │   │   ├── hand_visibility.py   # Phase 2 check: both-hands OR single-hand visibility
 │   │   ├── hand_object_interaction.py  # Phase 2 check: hand in grasp pose
-│   │   ├── luminance_blur.py    # Phase 2 check: brightness stability and blur
+│   │   ├── luminance.py         # Phase 2 check: luminance zones + flicker detection
+│   │   ├── pixelation.py       # Phase 2 check: block boundary gradient ratio
 │   │   ├── motion_analysis.py   # Phase 2 checks: camera stability, frozen segments
 │   │   ├── participants.py      # Phase 1 helper: other person detection
 │   │   ├── pov_hand_angle.py    # Phase 2 check: hand-camera angle

@@ -136,7 +136,8 @@ Each checkable segment is validated against remaining checks. Binary pass/fail �
 
 | Check | Model | Acceptance Condition |
 |---|---|---|
-| Luminance & Blur | Tenengrad | >= 70% good frames + stable brightness |
+| Luminance | Mean grayscale + flicker detection | >= 80% good frames (no dead black / too dark / blown out / flicker) |
+| Pixelation | Block boundary gradient ratio | >= 80% non-pixelated frames (blockiness <= 1.5) |
 | Camera Stability | LK optical flow at 0.5x, high-pass jitter filter (GPU when available) | Jitter score <= 0.181 |
 | Frozen Segments | LK signal | No > 30 consecutive frozen frames |
 | Hand Visibility | Hands23 | Both hands in frame in >= 80% frames **OR** at least one hand in frame in >= 90% frames (bbox > 0px from edge) |
@@ -386,7 +387,8 @@ hl-bachman/
     ├── checks/
     │   ├── check_results.py     # CheckResult dataclass
     │   ├── video_metadata.py    # 6 metadata checks
-    │   ├── luminance_blur.py    # Tenengrad + luminance + brightness stability
+    │   ├── luminance.py         # Luminance zones + flicker detection
+    │   ├── pixelation.py       # Block boundary gradient ratio
     │   ├── motion_analysis.py   # MotionAnalyzer (single-pass LK) + segment-slicer
     │   ├── participants.py      # Wearer-vs-other heuristics
     │   ├── hand_visibility.py   # Hand detection check

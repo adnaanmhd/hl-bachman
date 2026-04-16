@@ -150,7 +150,7 @@ def check_camera_stability_phase_corr(
 ```
 
 **Comparison Logic:**
-- Implements same signature as production `check_camera_stability()` from motion_analysis.py
+- Implements alternative stability check for benchmarking against the production single-pass `MotionAnalyzer` approach
 - Allows side-by-side timing and results comparison
 - Scoring function `_phase_corr_score()` mirrors production logic but without rotation component
 

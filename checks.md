@@ -47,7 +47,8 @@ labeled **USABLE** in the timeline; segments that fail any check are labeled
 
 | Check                   | Acceptance Condition                                                                          | Model / Method                                  |
 | ----------------------- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| Luminance & Blur        | (accept + review) frames >= 70% AND brightness std dev <= 60                                  | Tenengrad sharpness + luminance zones           |
+| Luminance               | >= 80% good frames (no dead black / too dark / blown out / flicker)                            | Mean grayscale + rolling stddev flicker          |
+| Pixelation              | >= 80% non-pixelated frames (blockiness ratio <= 1.5)                                          | Block boundary gradient ratio (8x8 grid)        |
 | Camera Stability        | High-pass filtered LK jitter score <= 0.181                                                   | Sparse Lucas-Kanade optical flow at 0.5x, high-pass filtered (GPU when available) |
 | Frozen Segments         | No > 30 consecutive frames with near-zero LK motion (trans < 0.1px, rot < 0.001°)             | LK optical flow signal (zero marginal cost)     |
 | Hand Visibility         | >= 80% frames with both hands fully in frame **OR** >= 90% frames with at least one hand fully in frame (bbox > 0 px from every edge, confidence >= 0.7) | Hands23 detection + bbox edge clearance         |
@@ -100,34 +101,29 @@ The segment passes if overall score <= `shaky_score_threshold` (default 0.181).
 CUDA GPU acceleration is used automatically when OpenCV is built with CUDA
 support (`cv2.cuda.SparsePyrLKOpticalFlow`), with transparent CPU fallback.
 
-### Luminance & Blur
+### Luminance
 
-Per-frame classification using the decision table below, followed by segment-level
-aggregation. Two acceptance conditions must both pass:
+Per-frame luminance classification with brightness flicker detection.
+Pass if >= 80% of frames are good (no luminance reject and no flicker).
 
-1. (accept + review) frames >= 70% of total frames
-2. Brightness stability: std dev of per-frame mean luminance <= 60
+| Condition   | Mean Luminance | Decision |
+| ----------- | -------------- | -------- |
+| Dead black  | < 15           | Reject   |
+| Too dark    | 15 - 45        | Reject   |
+| Usable      | 45 - 230       | Accept   |
+| Blown out   | > 230          | Reject   |
 
-| Condition              | Mean Luminance | Normalized Tenengrad | Raw Tenengrad | Decision |
-| ---------------------- | -------------- | -------------------- | ------------- | -------- |
-| Dead black             | < 20           | --                   | --            | Reject   |
-| Too dark               | 20 - 40        | --                   | --            | Reject   |
-| Low light / noise zone | 40 - 70        | Unreliable -- ignore | < 80          | Reject   |
-| Low light / noise zone | 40 - 70        | Unreliable -- ignore | 80 - 200      | Review   |
-| Low light / noise zone | 40 - 70        | Unreliable -- ignore | > 200         | Accept   |
-| Normal range           | 70 - 210       | < 0.04               | --            | Reject   |
-| Normal range           | 70 - 210       | 0.04 - 0.10          | --            | Review   |
-| Normal range           | 70 - 210       | 0.10 - 0.30          | --            | Accept   |
-| Normal range           | 70 - 210       | > 0.30               | --            | Accept   |
-| Soft overexposed       | 210 - 235      | < 0.04               | --            | Reject   |
-| Soft overexposed       | 210 - 235      | 0.04 - 0.10          | --            | Review   |
-| Soft overexposed       | 210 - 235      | > 0.10               | --            | Accept   |
-| Blown out              | > 235          | --                   | --            | Reject   |
+**Flicker detection:** Rolling stddev over a 10-frame window. If stddev > 30,
+all frames in the window are rejected as `brightness_flicker`.
 
-**Tenengrad computation:** Sobel gradient magnitude. Raw = mean(Gx^2 + Gy^2).
-Normalized = raw / (mean_luminance^2 + epsilon). In the low-light noise zone
-(luminance 40-70), normalized Tenengrad is unreliable due to noise amplification,
-so raw Tenengrad is used instead.
+### Pixelation
+
+Block boundary gradient ratio at 8x8 grid. Measures the ratio of gradient
+energy at block boundaries vs. interior positions. Compression artifacts and
+upscaled low-res sources produce artificially strong edges at block boundaries.
+
+Pass if >= 80% of frames have blockiness ratio <= 1.5. Clean footage scores
+~0.97-1.0; pixelated footage scores >> 1.5.
 
 ### Face Presence (strict)
 
