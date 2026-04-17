@@ -1,194 +1,124 @@
-"""Luminance & flicker quality check.
+"""Luminance + flicker accumulator.
 
-Two signals combined into a single pass/fail verdict:
-1. Luminance — per-frame dark/blown-out rejection
-2. Brightness flicker — rolling stddev detection
+Per-frame: bucket each sampled frame into {dead_black, too_dark, usable,
+blown_out} and hold onto mean-luminance for the rolling flicker window.
+Finalize: fail if fewer than `good_frame_ratio` of sampled frames were
+usable-and-non-flickering.
 
-Video-level: pass if good frames >= min_good_ratio of total.
+`luminance_class` encoding (stored in the parquet):
+    0 = dead_black   (mean < dead_black_max)
+    1 = too_dark     (dead_black_max <= mean < too_dark_max)
+    2 = usable       (too_dark_max <= mean <= blown_out_min)
+    3 = blown_out    (mean > blown_out_min)
+
+`luminance_flicker` is True for each frame inside any
+`flicker_window`-sized rolling window whose stddev exceeds
+`flicker_stddev_threshold`.
 """
+
+from __future__ import annotations
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
-
-from bachman_cortex.checks.check_results import CheckResult
+from dataclasses import dataclass, field
 
 
-@dataclass
-class LuminanceConfig:
-    """Thresholds for luminance and flicker checks."""
-    # Luminance zones (0-255 grayscale mean)
-    lum_dead_black: float = 15.0
-    lum_too_dark: float = 45.0
-    lum_blown_out: float = 230.0
-
-    # Brightness stability — flicker
+@dataclass(frozen=True)
+class LuminanceThresholds:
+    good_frame_ratio: float = 0.80
+    dead_black_max: float = 15.0
+    too_dark_max: float = 45.0
+    blown_out_min: float = 230.0
     flicker_window: int = 10
-    flicker_std_threshold: float = 30.0
-
-    # Video-level
-    min_good_ratio: float = 0.80
+    flicker_stddev_threshold: float = 30.0
 
 
 @dataclass
-class FrameMetrics:
-    """Per-frame luminance metrics."""
-    frame_idx: int
-    mean_luminance: float
-    label: str          # accept, reject
-    reject_reason: str  # "" if accepted
+class LuminanceFinalizeResult:
+    pass_fail: bool
+    detected: str
+    class_array: list[int]         # per-sampled-frame 0..3
+    flicker_array: list[bool]      # per-sampled-frame
+    sample_indices: list[int]      # native frame idx of each sample
+    good_ratio: float
 
 
-def compute_frame_metrics(frame: np.ndarray, frame_idx: int) -> FrameMetrics:
-    """Compute luminance for a single frame."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    mean_lum = float(np.mean(gray))
-
-    return FrameMetrics(
-        frame_idx=frame_idx,
-        mean_luminance=mean_lum,
-        label="",
-        reject_reason="",
-    )
+def _classify(mean: float, th: LuminanceThresholds) -> int:
+    if mean < th.dead_black_max:
+        return 0
+    if mean < th.too_dark_max:
+        return 1
+    if mean > th.blown_out_min:
+        return 3
+    return 2
 
 
-def classify_luminance(m: FrameMetrics, cfg: LuminanceConfig) -> FrameMetrics:
-    """Classify a frame by luminance."""
-    lum = m.mean_luminance
+@dataclass
+class LuminanceAccumulator:
+    """Consume 360p frames at luminance cadence; finalise at end of video.
 
-    if lum < cfg.lum_dead_black:
-        m.label, m.reject_reason = "reject", "dead_black"
-    elif lum < cfg.lum_too_dark:
-        m.label, m.reject_reason = "reject", "too_dark"
-    elif lum > cfg.lum_blown_out:
-        m.label, m.reject_reason = "reject", "blown_out"
-    else:
-        m.label = "accept"
-
-    return m
-
-
-def detect_flicker(
-    luminances: list[float],
-    cfg: LuminanceConfig,
-) -> list[bool]:
-    """Detect visible brightness flicker via rolling stddev.
-
-    A window of flicker_window frames slides across the luminance series.
-    If the stddev within the window exceeds flicker_std_threshold, all
-    frames in that window are marked True.
+    The accumulator is agnostic to total frame count — it grows only
+    with the number of samples actually processed.
     """
-    n = len(luminances)
-    if n < cfg.flicker_window:
-        return [False] * n
 
-    flicker = [False] * n
-    lum_arr = np.array(luminances)
+    thresholds: LuminanceThresholds = field(default_factory=LuminanceThresholds)
 
-    for start in range(n - cfg.flicker_window + 1):
-        window = lum_arr[start:start + cfg.flicker_window]
-        if float(np.std(window)) > cfg.flicker_std_threshold:
-            for k in range(start, start + cfg.flicker_window):
-                flicker[k] = True
+    _means: list[float] = field(init=False, default_factory=list)
+    _classes: list[int] = field(init=False, default_factory=list)
+    _sample_indices: list[int] = field(init=False, default_factory=list)
 
-    return flicker
+    def process_frame(self, frame_360p: np.ndarray, frame_idx: int) -> None:
+        """Add a sampled frame. Caller is responsible for the cadence gate."""
+        gray = cv2.cvtColor(frame_360p, cv2.COLOR_BGR2GRAY)
+        mean = float(np.mean(gray))
+        self._means.append(mean)
+        self._classes.append(_classify(mean, self.thresholds))
+        self._sample_indices.append(frame_idx)
 
+    def finalize(self) -> LuminanceFinalizeResult:
+        """Derive pass/fail + per-sample class + flicker arrays."""
+        th = self.thresholds
+        n = len(self._means)
+        if n == 0:
+            return LuminanceFinalizeResult(
+                pass_fail=False,
+                detected="no_samples",
+                class_array=[],
+                flicker_array=[],
+                sample_indices=[],
+                good_ratio=0.0,
+            )
 
-def check_luminance(
-    frames: list[np.ndarray],
-    config: LuminanceConfig | None = None,
-    timestamps: list[float] | None = None,
-) -> CheckResult:
-    """Run luminance and flicker checks on sampled frames.
+        flicker = [False] * n
+        if n >= th.flicker_window:
+            means = np.asarray(self._means)
+            win = th.flicker_window
+            # Rolling stddev via cumulative sums: O(n).
+            cumsum = np.concatenate(([0.0], np.cumsum(means)))
+            cumsum_sq = np.concatenate(([0.0], np.cumsum(means ** 2)))
+            # For each window starting at k, mean = (cumsum[k+w]-cumsum[k])/w.
+            for start in range(n - win + 1):
+                s = cumsum[start + win] - cumsum[start]
+                ss = cumsum_sq[start + win] - cumsum_sq[start]
+                mean_w = s / win
+                var_w = max(0.0, ss / win - mean_w ** 2)
+                if np.sqrt(var_w) > th.flicker_stddev_threshold:
+                    for k in range(start, start + win):
+                        flicker[k] = True
 
-    Pass if good frames (no luminance reject, no flicker) >= min_good_ratio
-    of total frames.
-    """
-    cfg = config or LuminanceConfig()
+        good = sum(
+            1 for i in range(n)
+            if self._classes[i] == 2 and not flicker[i]
+        )
+        ratio = good / n
+        passes = ratio >= th.good_frame_ratio
+        detected = f"good_ratio={ratio:.3f}"
 
-    if not frames:
-        return CheckResult(status="fail", metric_value=0.0, confidence=1.0,
-                           details={"error": "no frames"})
-
-    # Per-frame metrics + luminance classification
-    all_metrics = []
-    for i, frame in enumerate(frames):
-        m = compute_frame_metrics(frame, i)
-        m = classify_luminance(m, cfg)
-        all_metrics.append(m)
-
-    luminances = [m.mean_luminance for m in all_metrics]
-
-    # Flicker detection
-    flicker = detect_flicker(luminances, cfg)
-
-    # Merge reject reasons per frame
-    reject_reasons: dict[str, int] = {}
-    rejected = [False] * len(frames)
-
-    for i, m in enumerate(all_metrics):
-        # Luminance rejects
-        if m.label == "reject":
-            rejected[i] = True
-            reject_reasons[m.reject_reason] = reject_reasons.get(m.reject_reason, 0) + 1
-            continue
-
-        # Flicker
-        if flicker[i]:
-            rejected[i] = True
-            reject_reasons["brightness_flicker"] = reject_reasons.get("brightness_flicker", 0) + 1
-            m.label, m.reject_reason = "reject", "brightness_flicker"
-            continue
-
-    total = len(frames)
-    reject_count = sum(rejected)
-    accept_count = total - reject_count
-    good_ratio = accept_count / total
-
-    status = "pass" if good_ratio >= cfg.min_good_ratio else "fail"
-
-    # Failure types present
-    failure_types = list(reject_reasons.keys())
-
-    # Flicker segments for diagnostics
-    flicker_segments = _find_runs(flicker, timestamps)
-
-    return CheckResult(
-        status=status,
-        metric_value=round(good_ratio, 4),
-        confidence=1.0,
-        details={
-            "accept_frames": accept_count,
-            "reject_frames": reject_count,
-            "total_frames": total,
-            "good_ratio": round(good_ratio, 4),
-            "min_good_ratio": cfg.min_good_ratio,
-            "reject_reasons": reject_reasons,
-            "failure_types": failure_types,
-            "flicker_segments": flicker_segments,
-        },
-    )
-
-
-def _find_runs(
-    mask: list[bool],
-    timestamps: list[float] | None,
-) -> list[dict]:
-    """Collapse a boolean mask into contiguous run dicts."""
-    runs: list[dict] = []
-    n = len(mask)
-    i = 0
-    while i < n:
-        if not mask[i]:
-            i += 1
-            continue
-        j = i + 1
-        while j < n and mask[j]:
-            j += 1
-        run: dict = {"start_frame": i, "end_frame": j, "length": j - i}
-        if timestamps is not None:
-            run["start_sec"] = timestamps[i] if i < len(timestamps) else None
-            run["end_sec"] = timestamps[j - 1] if j - 1 < len(timestamps) else None
-        runs.append(run)
-        i = j
-    return runs
+        return LuminanceFinalizeResult(
+            pass_fail=passes,
+            detected=detected,
+            class_array=list(self._classes),
+            flicker_array=flicker,
+            sample_indices=list(self._sample_indices),
+            good_ratio=round(ratio, 4),
+        )
