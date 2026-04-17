@@ -79,7 +79,7 @@ Both-hands and single-hand metrics may pass for the same frame (not mutually exc
 |---|---|
 | Luminance | ≥ 80% good frames (no dead black <15, too dark 15–45, blown out >230, no flicker) |
 | Stability | whole-video mean jitter score ≤ 0.181 (high-pass filtered LK) |
-| Frozen | no run > 30 consecutive native-frame-equivalents with near-zero motion (trans < 0.1 px, rot < 0.001°) |
+| Frozen | no run > 60 consecutive native-frame-equivalents with near-zero motion (trans < 0.1 px, rot < 0.001°) |
 | Pixelation | ≥ 80% frames with blockiness ratio ≤ 1.5 |
 
 ### Metadata thresholds (unchanged from current code; duration bump already committed)
@@ -429,7 +429,7 @@ w_jump = 0.20
 highpass_window_sec = 0.5
 
 [technical.frozen]
-max_consecutive = 30
+max_consecutive = 60
 trans_threshold = 0.1
 rot_threshold = 0.001
 

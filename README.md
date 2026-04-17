@@ -74,7 +74,7 @@ per-frame columns still land in parquet).
 | ---------- | ------------------------------------------------------------------------ |
 | luminance  | ≥ 80% good frames (not dead black / too dark / blown out / flicker).      |
 | stability  | Whole-video mean jitter score ≤ 0.181 (high-pass-filtered LK).             |
-| frozen     | No run > 30 consecutive native-frame-equivalents of near-zero motion.      |
+| frozen     | No run > 60 consecutive native-frame-equivalents of near-zero motion.      |
 | pixelation | ≥ 80% frames with blockiness ratio ≤ 1.5.                                  |
 
 ### Stage 3 — Quality metrics

@@ -59,7 +59,7 @@ class Stability:
 
 @dataclass(frozen=True)
 class Frozen:
-    max_consecutive: int = 30
+    max_consecutive: int = 60
     trans_threshold: float = 0.1
     rot_threshold: float = 0.001
 
@@ -200,7 +200,7 @@ w_jump = 0.20
 highpass_window_sec = 0.5
 
 [technical.frozen]
-max_consecutive = 30
+max_consecutive = 60
 trans_threshold = 0.1
 rot_threshold = 0.001
 
