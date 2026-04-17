@@ -26,9 +26,17 @@ bachman_cortex/tests/pipeline_results*.md
 
 # Videos
 *.mp4
+*.MP4
 *.mov
+*.MOV
 *.avi
 *.mkv
+
+# Vendored NVIDIA Video Codec SDK (local only, not committed)
+Video_Codec_SDK_*/
+
+# Batch run logs
+logs/
 
 # Internal docs (not for public repo)
 idea-brief.md
