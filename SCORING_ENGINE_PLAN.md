@@ -137,7 +137,7 @@ ffprobe metadata → run_all_metadata_checks
    │     • LuminanceAccumulator    (10 FPS; 360p)
    │     • PixelationAccumulator   (10 FPS; 720p)
    │     • ObstructionAccumulator  (2 FPS;  720p)
-   │     • Quality model bank      (2 FPS;  720p) — Hands23 + SCRFD + YOLO
+   │     • Quality model bank      (1 FPS;  720p) — Hands23 + SCRFD + YOLO
    │         → HandsAccumulator (both + single + angle + HOI)
    │         → ParticipantsAccumulator (YOLO + SCRFD + Hands23 extra-hand signal)
    │   per-frame results appended to in-memory row buffer (one row per native frame)
@@ -398,7 +398,7 @@ hl-score --dump-default-config > hl-score.toml
 
 ```toml
 [cadences]
-quality_fps = 2.0
+quality_fps = 1.0
 motion_fps = 30.0      # cap
 frozen_fps = 10.0
 luminance_fps = 10.0

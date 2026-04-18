@@ -30,7 +30,7 @@ ffprobe metadata → run_all_metadata_checks
    │     • LuminanceAccumulator    (10 FPS; 360p)
    │     • PixelationAccumulator   (10 FPS; 720p)
    │     • ObstructionAccumulator  (10 FPS; 720p)
-   │     • Quality model bank      (2 FPS;  720p) — Hands23 + SCRFD + YOLO
+   │     • Quality model bank      (1 FPS;  720p) — Hands23 + SCRFD + YOLO
    │         → HandsAccumulator (both + single + angle + HOI)
    │         → ParticipantsAccumulator (YOLO + SCRFD + Hands23 extra-hand signal)
    │   per-frame results appended to an in-memory row buffer

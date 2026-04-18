@@ -18,7 +18,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Cadences:
-    quality_fps: float = 2.0
+    quality_fps: float = 1.0
     motion_fps: float = 30.0       # cap
     frozen_fps: float = 10.0
     luminance_fps: float = 10.0
@@ -169,7 +169,7 @@ _DEFAULT_TEMPLATE = """\
 # to `Config()` — any edit shifts only the fields you change.
 
 [cadences]
-quality_fps = 2.0
+quality_fps = 1.0
 motion_fps = 30.0          # cap
 frozen_fps = 10.0
 luminance_fps = 10.0

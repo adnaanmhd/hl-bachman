@@ -48,7 +48,7 @@ Thresholds are configurable under `[technical.luminance]`, `[technical.stability
 
 Six per-frame metrics, each reported as `percent_frames` plus merged segments. `face_presence` as a standalone metric is removed — SCRFD face detection now feeds the participants signal.
 
-All quality checks run at 2 FPS on 720p frames.
+All quality checks run at 1 FPS on 720p frames.
 
 | Metric                 | Per-frame PASS                                                                                                   | Value (raw per-frame)                       | Value on fail                                          |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------ |

@@ -79,7 +79,7 @@ per-frame columns still land in parquet).
 
 ### Stage 3 — Quality metrics
 
-Six per-frame metrics at 2 FPS on 720p frames. Reported as
+Six per-frame metrics at 1 FPS on 720p frames. Reported as
 `percent_frames` (from the un-merged per-frame array) plus merged
 segments. Not pass/fail at the video level — these are observations.
 
