@@ -45,10 +45,11 @@ Rename scope: class + CLI + docs only. Package stays `bachman_cortex`.
 | Check | Target FPS | Resolution |
 |---|---|---|
 | Motion (stability source) | 30 (cap) | 360p (in-place 0.5× from 720p) |
-| Frozen (derived from motion) | 10 | Same signal as motion |
+| Frozen (derived from motion) | — (derived) | Same signal as motion |
 | Luminance | 10 | 360p (in-place downscale from 720p) |
 | Pixelation | 10 | 720p |
-| Quality metrics (hands, HOI, angle, participants, obstruction) | 2 | 720p |
+| Obstruction | 10 | 720p (piggybacks on pixelation cadence) |
+| Quality metrics (hands, HOI, angle, participants) | 1 | 720p |
 
 All cadences rooted at `frame_idx = 0`. Frame `i` ticks cadence `C` iff `i % round(native_fps / target_fps_C) == 0`.
 
@@ -131,7 +132,7 @@ ffprobe metadata → run_all_metadata_checks
    │                 Write report.md + {video}.json. NO parquet. Exit.
    ▼
 [Stage 2 + 3] Single streaming decode pass @ native FPS
-   │   chunked (default 256 frames) for frame-memory discipline
+   │   one frame at a time via a native-FPS generator (no chunking)
    │   each native frame dispatched to accumulators by cadence:
    │     • MotionAnalyzer          (30 FPS cap; 0.5× → 360p)
    │     • LuminanceAccumulator    (10 FPS; 360p)
@@ -161,7 +162,7 @@ Write report.md
 ### Invariants
 
 - **One decode per video.**
-- **Peak frame memory** ≈ `chunk_size × 2.7 MB` (720p BGR). Does not grow with video length.
+- **Peak frame memory** ≈ one 720p BGR frame (~2.7 MB) at a time — the extractor is a generator. Does not grow with video length.
 - **Per-frame row buffer** ≈ `native_fps × duration × ~80 B`. 1h × 30 FPS ≈ 8.6 MB.
 - Segmentation and merging run **only at report time**, from the completed row buffer — not during decode.
 - Parquet is the ground truth; report files are the curated view.

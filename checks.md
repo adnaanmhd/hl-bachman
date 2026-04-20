@@ -48,16 +48,16 @@ Thresholds are configurable under `[technical.luminance]`, `[technical.stability
 
 Six per-frame metrics, each reported as `percent_frames` plus merged segments. `face_presence` as a standalone metric is removed — SCRFD face detection now feeds the participants signal.
 
-All quality checks run at 1 FPS on 720p frames.
+Cadences: the five hand / participants metrics run at 1 FPS on 720p frames. `obstructed` piggybacks on the pixelation cadence (10 FPS, 720p) — the central-crop heuristic is cheap and benefits from denser sampling.
 
-| Metric                 | Per-frame PASS                                                                                                   | Value (raw per-frame)                       | Value on fail                                          |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------ |
-| both_hands_visibility  | Hands23 detects L **and** R, each conf ≥ 0.7.                                                                    | max(L_conf, R_conf)                         | 0.0                                                    |
-| single_hand_visibility | ≥1 hand with Hands23 conf ≥ 0.7.                                                                                 | max Hands23 conf                            | 0.0                                                    |
-| hand_obj_interaction   | ≥1 detected hand with contact state ∈ {P, F}.                                                                    | contact char of qualifying hand (P/F)       | most-confident hand's char (N/S/O); null if zero hands |
-| hand_angle             | all detected hands' angles ≤ 40° (zero hands → fail).                                                            | mean angle of detected hands (degrees)      | mean angle; NaN if no hands                            |
-| participants           | ≥1 "other person" signal from {YOLO (≥0.6, wearer-filtered), SCRFD (≥0.6, wearer-filtered), extra Hands23 hand}. | max(YOLO_conf, SCRFD_conf, extra_hand_conf) | 0.0                                                    |
-| obstructed             | Heuristic triggers ≥2 of 4 signals on the central 80% crop.                                                      | `true`                                      | `false`                                                |
+| Metric                 | Per-frame PASS                                                                                                   | Value (raw per-frame)                       | Value on fail                                          | Cadence |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------ | ------- |
+| both_hands_visibility  | Hands23 detects L **and** R, each conf ≥ 0.7.                                                                    | max(L_conf, R_conf)                         | 0.0                                                    | 1 FPS   |
+| single_hand_visibility | ≥1 hand with Hands23 conf ≥ 0.7.                                                                                 | max Hands23 conf                            | 0.0                                                    | 1 FPS   |
+| hand_obj_interaction   | ≥1 detected hand with contact state ∈ {P, F}.                                                                    | contact char of qualifying hand (P/F)       | most-confident hand's char (N/S/O); null if zero hands | 1 FPS   |
+| hand_angle             | all detected hands' angles ≤ 40° (zero hands → fail).                                                            | mean angle of detected hands (degrees)      | mean angle; NaN if no hands                            | 1 FPS   |
+| participants           | ≥1 "other person" signal from {YOLO (≥0.6, wearer-filtered), SCRFD (≥0.6, wearer-filtered), extra Hands23 hand}. | max(YOLO_conf, SCRFD_conf, extra_hand_conf) | 0.0                                                    | 1 FPS   |
+| obstructed             | Heuristic triggers ≥2 of 4 signals on the central 80% crop.                                                      | `true`                                      | `false`                                                | 10 FPS  |
 
 Both_hands and single_hand may pass for the same frame (not mutually exclusive).
 

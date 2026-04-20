@@ -79,18 +79,20 @@ per-frame columns still land in parquet).
 
 ### Stage 3 — Quality metrics
 
-Six per-frame metrics at 1 FPS on 720p frames. Reported as
-`percent_frames` (from the un-merged per-frame array) plus merged
-segments. Not pass/fail at the video level — these are observations.
+Six per-frame metrics, reported as `percent_frames` (from the
+un-merged per-frame array) plus merged segments. Not pass/fail at the
+video level — these are observations. Five metrics run at 1 FPS on
+720p frames; `obstructed` piggybacks on the pixelation cadence
+(10 FPS, 720p).
 
-| Metric                  | Per-frame condition                                                                                     |
-| ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| both_hands_visibility   | Hands23 detects L AND R, each conf ≥ 0.7.                                                                |
-| single_hand_visibility  | ≥1 hand with Hands23 conf ≥ 0.7.                                                                         |
-| hand_obj_interaction    | ≥1 detected hand with contact state ∈ {P, F}.                                                            |
-| hand_angle              | All detected hands within 40° of frame centre.                                                           |
-| participants            | ≥1 other-person signal (YOLO ≥0.6, SCRFD ≥0.6, Hands23 extra-hand ≥0.7). Wearer-filtered on YOLO + SCRFD. |
-| obstructed              | ≥2 of 4 heuristic signals triggered on the central 80% crop.                                             |
+| Metric                  | Per-frame condition                                                                                     | Cadence    |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- | ---------- |
+| both_hands_visibility   | Hands23 detects L AND R, each conf ≥ 0.7.                                                                | 1 FPS      |
+| single_hand_visibility  | ≥1 hand with Hands23 conf ≥ 0.7.                                                                         | 1 FPS      |
+| hand_obj_interaction    | ≥1 detected hand with contact state ∈ {P, F}.                                                            | 1 FPS      |
+| hand_angle              | All detected hands within 40° of frame centre.                                                           | 1 FPS      |
+| participants            | ≥1 other-person signal (YOLO ≥0.6, SCRFD ≥0.6, Hands23 extra-hand ≥0.7). Wearer-filtered on YOLO + SCRFD. | 1 FPS      |
+| obstructed              | ≥2 of 4 heuristic signals triggered on the central 80% crop.                                             | 10 FPS     |
 
 ---
 
@@ -180,7 +182,8 @@ hl-bachman/
 ├── checks.md                    # Check specifications.
 ├── README.md                    # This file.
 ├── scripts/
-│   └── install_opencv_cuda.sh   # Builds custom OpenCV + NVDEC.
+│   ├── install_opencv_cuda.sh      # Builds custom OpenCV + NVDEC.
+│   └── reconstruct_batch_report.py # Rebuild batch report from per-video JSONs.
 └── bachman_cortex/
     ├── __init__.py              # Installs cv2.dnn shim.
     ├── _cv2_dnn_shim.py         # Pure-numpy blobFromImage.
