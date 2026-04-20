@@ -1,90 +1,149 @@
-"""Shared data structures for the validation & processing pipeline."""
+"""Data types for the scoring engine.
+
+Schema matches SCORING_ENGINE_PLAN.md §4. Reports are assembled from these
+dataclasses; parquet is a separate artefact (see `per_frame_store.py`).
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Union
 
-from bachman_cortex.checks.check_results import CheckResult
+
+# ── Metadata stage ────────────────────────────────────────────────────────
+
+@dataclass
+class MetadataCheckResult:
+    check: str          # "format" | "encoding" | "resolution" | "frame_rate" | "duration" | "orientation"
+    status: str         # "pass" | "fail"
+    accepted: str
+    detected: str
+
+
+# ── Technical stage ───────────────────────────────────────────────────────
+
+@dataclass
+class TechnicalCheckResult:
+    check: str          # "stability" | "frozen" | "luminance" | "pixelation"
+    status: str         # "pass" | "fail" | "skipped"
+    accepted: str
+    detected: str
+    skipped: bool = False
+
+
+# ── Quality stage ─────────────────────────────────────────────────────────
+
+@dataclass
+class QualitySegment:
+    """Half-open segment [start_s, end_s) of a single quality metric.
+
+    `value` type varies per metric (see §1 of plan):
+      - confidence-based metrics: float in [0.0, 1.0]
+      - hand_angle: float (degrees) or NaN if no hands
+      - hand_obj_interaction: str (contact char) or None
+      - obstructed: bool
+    """
+    start_s: float
+    end_s: float
+    duration_s: float
+    value: Union[float, str, bool, None]
+    value_label: str    # "confidence" | "angle" | "contact_state" | "obstructed"
 
 
 @dataclass
-class TimeSegment:
-    """A contiguous time range in seconds."""
-    start_sec: float
-    end_sec: float
+class QualityMetricResult:
+    metric: str         # see §4 of plan
+    percent_frames: float
+    segments: list[QualitySegment]
+    skipped: bool = False
 
-    @property
-    def duration(self) -> float:
-        return self.end_sec - self.start_sec
+
+# ── Aggregates for batch stats ────────────────────────────────────────────
+
+@dataclass
+class CheckStats:
+    pass_count: int
+    pass_duration_s: float
+    fail_count: int
+    fail_duration_s: float
+    skipped_count: int = 0
 
 
 @dataclass
-class FrameLabel:
-    """Per-frame pass/fail result for a single check."""
-    frame_idx: int
-    timestamp_sec: float
-    passed: bool
-    confidence: float = 0.0
-    labels: list[str] | None = None
+class QualityStats:
+    mean_percent: float
+    median_percent: float
+    min_percent: float
+    max_percent: float
 
 
-@dataclass
-class CheckFrameResults:
-    """Per-frame results for one check across all frames."""
-    check_name: str
-    frame_labels: list[FrameLabel]
-    bad_segments: list[TimeSegment]
-
+# ── Error reporting ───────────────────────────────────────────────────────
 
 @dataclass
-class CheckableSegment:
-    """A contiguous good segment from Phase 1, eligible for Phase 2."""
-    segment_idx: int
-    start_sec: float
-    end_sec: float
-
-    @property
-    def duration(self) -> float:
-        return self.end_sec - self.start_sec
-
-
-@dataclass
-class SegmentValidationResult:
-    """Phase 2 result for a single checkable segment."""
-    segment: CheckableSegment
-    passed: bool
-    check_results: dict[str, CheckResult]
-    failing_checks: list[str] = field(default_factory=list)
-
-
-@dataclass
-class VideoProcessingResult:
-    """Complete processing result for one video."""
+class ProcessingErrorReport:
     video_path: str
     video_name: str
-    original_duration_sec: float
-    metadata: dict
+    error_reason: str   # "audio_only" | "decode_failed" | "corrupt" | "metadata_probe_failed" | ...
 
-    # Phase 0
-    metadata_passed: bool
-    metadata_results: dict[str, CheckResult]
 
-    # Phase 1
-    phase1_check_frame_results: list[CheckFrameResults]
-    phase1_bad_segments: list[TimeSegment]
-    phase1_discarded_segments: list[TimeSegment]
-    prefiltered_segments: list[CheckableSegment]
+# ── Top-level reports ─────────────────────────────────────────────────────
 
-    # Phase 2
-    segment_results: list[SegmentValidationResult]
-    usable_segments: list[CheckableSegment]
-    rejected_segments: list[CheckableSegment]
+@dataclass
+class VideoScoreReport:
+    video_path: str
+    video_name: str
+    generated_at: str                # ISO 8601 UTC
+    processing_wall_time_s: float
+    duration_s: float
 
-    # Phase 3
-    usable_duration_sec: float
-    unusable_duration_sec: float
-    yield_ratio: float
+    metadata_checks: list[MetadataCheckResult] = field(default_factory=list)
+    technical_checks: list[TechnicalCheckResult] = field(default_factory=list)
+    quality_metrics: list[QualityMetricResult] = field(default_factory=list)
 
-    processing_time_sec: float = 0.0
-    error: str | None = None
+    technical_skipped: bool = False
+    quality_skipped: bool = False
 
-    # Preprocessing info (populated only when --hevc-to-h264 is active)
-    transcode_info: dict | None = None
+
+@dataclass
+class BatchScoreReport:
+    generated_at: str
+    video_count: int
+    total_duration_s: float
+    total_wall_time_s: float
+
+    metadata_check_stats: dict[str, CheckStats] = field(default_factory=dict)
+    technical_check_stats: dict[str, CheckStats] = field(default_factory=dict)
+    quality_metric_stats: dict[str, QualityStats] = field(default_factory=dict)
+
+    videos: list[VideoScoreReport] = field(default_factory=list)
+    errors: list[ProcessingErrorReport] = field(default_factory=list)
+
+
+# ── Canonical metric/check names ──────────────────────────────────────────
+
+METADATA_CHECKS: tuple[str, ...] = (
+    "format", "encoding", "resolution", "frame_rate", "duration", "orientation",
+)
+
+TECHNICAL_CHECKS: tuple[str, ...] = (
+    "luminance", "stability", "frozen", "pixelation",
+)
+
+QUALITY_METRICS: tuple[str, ...] = (
+    "both_hands_visibility",
+    "single_hand_visibility",
+    "hand_obj_interaction",
+    "hand_angle",
+    "participants",
+    "obstructed",
+)
+
+# Value labels keyed by quality metric name
+QUALITY_VALUE_LABELS: dict[str, str] = {
+    "both_hands_visibility": "confidence",
+    "single_hand_visibility": "confidence",
+    "hand_obj_interaction": "contact_state",
+    "hand_angle": "angle",
+    "participants": "confidence",
+    "obstructed": "obstructed",
+}

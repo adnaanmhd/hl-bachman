@@ -1,753 +1,444 @@
-"""Report generation for the validation & processing pipeline.
+"""Per-video + batch report writers.
 
-Generates per-video timeline reports and batch-level summary reports.
-No clip files are produced — reports describe usable/unusable/rejected
-time ranges with failing reasons.
+Per-video:    `report.md`, `{video_name}.json`, `{video_name}.parquet`
+Batch:        `batch_report.md`, `batch_results.json`, `batch_results.csv`
+
+The dataclasses in `data_types.py` are the single source of truth — this
+module is pure formatting. Parquet is written separately by the
+`PerFrameStore` handed back from the engine.
+
+Output dir layout (§5):
+
+    results/run_NNN/
+        {video_name}/
+            report.md
+            {video_name}.json
+            {video_name}.parquet     # omitted if metadata failed
+        batch_report.md
+        batch_results.json
+        batch_results.csv
 """
 
-from dataclasses import dataclass
-from datetime import datetime
+from __future__ import annotations
+
+import csv
+import dataclasses
+import json
+import math
+import os
+import statistics
 from pathlib import Path
+from typing import Any
 
-from bachman_cortex.checks.check_results import CheckResult
 from bachman_cortex.data_types import (
-    VideoProcessingResult,
-    TimeSegment,
-    CheckFrameResults,
-    SegmentValidationResult,
+    BatchScoreReport,
+    CheckStats,
+    METADATA_CHECKS,
+    MetadataCheckResult,
+    QUALITY_METRICS,
+    QUALITY_VALUE_LABELS,
+    QualityMetricResult,
+    QualitySegment,
+    QualityStats,
+    TECHNICAL_CHECKS,
+    TechnicalCheckResult,
+    VideoScoreReport,
 )
-from bachman_cortex.pipeline import PipelineConfig
-from bachman_cortex.utils.review_runs import ReviewRun, collapse_review_runs
+from bachman_cortex.per_frame_store import PerFrameStore
 
 
-_FACE_REVIEW_LO = 0.5
-_FACE_REVIEW_HI = 0.8
-_REVIEW_MIN_DURATION_S = 2.0
+_STATUS_DISPLAY = {
+    "pass": "PASS", "fail": "FAIL", "skipped": "SKIPPED",
+}
 
 
-# ── Timeline entry ───────────────────────────────────────────────────────
+def _fmt_status(status: str) -> str:
+    return _STATUS_DISPLAY.get(status.lower(), status.upper())
 
 
-@dataclass
-class TimelineEntry:
-    """One row in the unified chronological timeline."""
-    start_sec: float
-    end_sec: float
-    category: str  # "USABLE" | "UNUSABLE" | "REJECTED"
-    reasons: list[str]
-
-    @property
-    def duration(self) -> float:
-        return self.end_sec - self.start_sec
-
-
-# ── Accepted / Observed value helpers ────────────────────────────────────
-
-
-def _meta_accepted_observed(name: str, r: CheckResult) -> tuple[str, str]:
-    """Return (accepted_value, observed_value) for a metadata check."""
-    d = r.details or {}
-    if name == "meta_format":
-        return "mp4", d.get("container_format", "?")
-    elif name == "meta_encoding":
-        return d.get("expected", "h264 or hevc"), d.get("video_codec", "?")
-    elif name == "meta_resolution":
-        return (
-            f">={d.get('min_width', 1920)}x{d.get('min_height', 1080)}",
-            f"{d.get('width', '?')}x{d.get('height', '?')}",
-        )
-    elif name == "meta_frame_rate":
-        return f">={d.get('min_fps', 28.0)} FPS", f"{d.get('fps', '?')} FPS"
-    elif name == "meta_duration":
-        return f">={d.get('min_duration_s', 119.0)}s", f"{d.get('duration_s', '?')}s"
-    elif name == "meta_orientation":
-        return (
-            f"rotation {d.get('expected_rotation', '0 or 180')}, landscape",
-            f"rotation={d.get('rotation', '?')}, {d.get('width', '?')}x{d.get('height', '?')}",
-        )
-    return "-", "-"
-
-
-def _segment_accepted_observed(name: str, r: CheckResult) -> tuple[str, str]:
-    """Return (accepted_value, observed_value) for a Phase 2 segment check."""
-    d = r.details or {}
-    metric = r.metric_value
-
-    if name == "luminance":
-        threshold = d.get("min_good_ratio", "?")
-        return f">={_fmt_pct(threshold)}", _fmt_pct(metric)
-    elif name == "ml_hand_visibility":
-        both_th = d.get("both_hands_pass_rate", "?")
-        single_th = d.get("single_hand_pass_rate", "?")
-        both_obs = d.get("both_hands_ratio", metric)
-        single_obs = d.get("single_hand_ratio", "?")
-        accepted = f"both>={_fmt_pct(both_th)} OR single>={_fmt_pct(single_th)}"
-        observed = f"both={_fmt_pct(both_obs)}, single={_fmt_pct(single_obs)}"
-        return accepted, observed
-    elif name == "ml_hand_object_interaction":
-        threshold = d.get("pass_rate_threshold", "?")
-        return f">={_fmt_pct(threshold)}", _fmt_pct(metric)
-    elif name == "ml_view_obstruction":
-        max_ratio = d.get("max_allowed_ratio", "?")
-        obstructed = d.get("obstructed_ratio", 1.0 - metric)
-        return f"obstructed <={_fmt_pct(max_ratio)}", f"obstructed {_fmt_pct(obstructed)}"
-    elif name == "ml_pov_hand_angle":
-        threshold = d.get("pass_rate_threshold", "?")
-        return f">={_fmt_pct(threshold)}", _fmt_pct(metric)
-    elif name == "ml_face_presence":
-        threshold = d.get("threshold", "?")
-        frames_with = d.get("frames_with_prominent_face", 0)
-        total = d.get("total_frames", 0)
-        max_conf = d.get("max_face_confidence_seen", 0.0)
-        accepted = f"0 frames with face conf >={threshold}"
-        observed = f"{frames_with}/{total} frames, max conf {max_conf:.2f}"
-        return accepted, observed
-    elif name == "motion_camera_stability":
-        threshold = d.get("shaky_score_threshold", "?")
-        return f"<={_fmt_pct(threshold)}", _fmt_pct(metric)
-    elif name == "motion_frozen_segments":
-        max_consec = d.get("max_consecutive_native", "?")
-        longest = d.get("longest_frozen_run_native_est", metric)
-        return f"<{max_consec} consecutive frozen", f"{longest:.1f} longest run"
-
-    return "-", f"{metric:.4f}"
-
-
-# ── Formatting helpers ───────────────────────────────────────────────────
-
-
-def _fmt_pct(value) -> str:
-    """Format a 0-1 ratio as a percentage string."""
-    if isinstance(value, (int, float)):
-        return f"{value:.1%}"
+def _fmt_value(value: Any) -> str:
+    """Segment value formatting per plan §6:
+    floats → 2 decimals, strings/bools → as-is, NaN → 'NaN'.
+    """
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        return f"{value:.2f}"
+    if isinstance(value, int):
+        return str(value)
     return str(value)
 
 
-def _fmt_ts(seconds: float) -> str:
-    """Format seconds as HH:MM:SS.mmm."""
-    if seconds < 0:
-        seconds = 0.0
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds - h * 3600 - m * 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
+# ── Output layout ──────────────────────────────────────────────────────────
 
+def allocate_run_dir(out_root: str | Path, max_attempts: int = 100) -> Path:
+    """Create `run_NNN` under `out_root` via atomic mkdir with bump-on-collision.
 
-def _fmt_duration(seconds: float) -> str:
-    """Format a duration as '123.4s (2m 3s)' or '45.6s' for short values."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds - h * 3600 - m * 60
-    if h:
-        return f"{seconds:.1f}s ({h}h {m}m {s:.0f}s)"
-    return f"{seconds:.1f}s ({m}m {s:.0f}s)"
-
-
-def _segments_overlap(a_start: float, a_end: float, b: TimeSegment) -> bool:
-    return a_start < b.end_sec and b.start_sec < a_end
-
-
-def _count_bad_frames_in_window(
-    cfr: CheckFrameResults, start_sec: float, end_sec: float,
-) -> tuple[int, int]:
-    """Return (bad_frame_count, total_frame_count) within the time window."""
-    bad = 0
-    total = 0
-    for fl in cfr.frame_labels:
-        if start_sec <= fl.timestamp_sec < end_sec:
-            total += 1
-            if not fl.passed:
-                bad += 1
-    return bad, total
-
-
-# ── Timeline construction ────────────────────────────────────────────────
-
-
-def _phase1_bad_reasons(
-    seg_start: float,
-    seg_end: float,
-    phase1_check_results: list[CheckFrameResults],
-) -> list[str]:
-    """For a merged Phase 1 bad segment, list the failing checks with counts."""
-    reasons: list[str] = []
-    for cfr in phase1_check_results:
-        if not any(_segments_overlap(seg_start, seg_end, bs)
-                   for bs in cfr.bad_segments):
-            continue
-        bad, total = _count_bad_frames_in_window(cfr, seg_start, seg_end)
-        if total > 0:
-            reasons.append(f"{cfr.check_name} ({bad}/{total} frames failed)")
-        else:
-            reasons.append(cfr.check_name)
-    return reasons or ["phase1_unknown"]
-
-
-def _segment_reject_reasons(sr: SegmentValidationResult) -> list[str]:
-    """For a Phase 2 rejected segment, list failing checks + observed metrics."""
-    reasons: list[str] = []
-    for name in sr.failing_checks:
-        r = sr.check_results.get(name)
-        if r is None:
-            reasons.append(name)
-            continue
-        accepted, observed = _segment_accepted_observed(name, r)
-        reasons.append(f"{name} (accepted {accepted}; observed {observed})")
-    return reasons or ["phase2_unknown"]
-
-
-def _metadata_reject_reasons(
-    meta_results: dict[str, CheckResult],
-) -> list[str]:
-    """List failing metadata checks with accepted/observed values."""
-    reasons: list[str] = []
-    for name, r in meta_results.items():
-        if r.status != "fail":
-            continue
-        accepted, observed = _meta_accepted_observed(name, r)
-        reasons.append(f"{name} (accepted {accepted}; observed {observed})")
-    return reasons or ["metadata_unknown"]
-
-
-def _build_timeline(result: VideoProcessingResult) -> list[TimelineEntry]:
-    """Build the unified chronological timeline for a successful video.
-
-    Does not handle metadata-fail videos; caller must branch for those.
+    NNN is zero-padded to 3 digits up to 999, then auto-extends.
     """
-    entries: list[TimelineEntry] = []
+    root = Path(out_root)
+    root.mkdir(parents=True, exist_ok=True)
+    existing = [p.name for p in root.iterdir() if p.is_dir()
+                and p.name.startswith("run_")]
+    start = 1
+    for name in existing:
+        suffix = name.removeprefix("run_")
+        if suffix.isdigit():
+            start = max(start, int(suffix) + 1)
 
-    # USABLE — segments that passed Phase 2
-    for seg in result.usable_segments:
-        entries.append(TimelineEntry(
-            start_sec=seg.start_sec,
-            end_sec=seg.end_sec,
-            category="USABLE",
-            reasons=[],
-        ))
-
-    # UNUSABLE — Phase 1 bad segments
-    for seg in result.phase1_bad_segments:
-        entries.append(TimelineEntry(
-            start_sec=seg.start_sec,
-            end_sec=seg.end_sec,
-            category="UNUSABLE",
-            reasons=_phase1_bad_reasons(
-                seg.start_sec, seg.end_sec, result.phase1_check_frame_results,
-            ),
-        ))
-
-    # UNUSABLE — Phase 1 discarded (clean gaps too short for Phase 2)
-    for seg in result.phase1_discarded_segments:
-        entries.append(TimelineEntry(
-            start_sec=seg.start_sec,
-            end_sec=seg.end_sec,
-            category="UNUSABLE",
-            reasons=["segment_too_short"],
-        ))
-
-    # REJECTED — Phase 2 validation failures
-    for sr in result.segment_results:
-        if sr.passed:
+    for attempt in range(max_attempts):
+        n = start + attempt
+        width = max(3, len(str(n)))
+        candidate = root / f"run_{n:0{width}d}"
+        try:
+            os.makedirs(candidate, exist_ok=False)
+            return candidate
+        except FileExistsError:
             continue
-        entries.append(TimelineEntry(
-            start_sec=sr.segment.start_sec,
-            end_sec=sr.segment.end_sec,
-            category="REJECTED",
-            reasons=_segment_reject_reasons(sr),
-        ))
-
-    entries.sort(key=lambda e: e.start_sec)
-    return entries
+    raise RuntimeError(
+        f"Could not allocate a fresh run_ directory under {root} "
+        f"after {max_attempts} attempts"
+    )
 
 
-def _timeline_table(entries: list[TimelineEntry]) -> list[str]:
-    """Render a unified timeline as a markdown table."""
-    if not entries:
-        return ["_No timeline entries._", ""]
+# ── Per-video JSON ─────────────────────────────────────────────────────────
 
-    lines = [
-        "| # | Start | End | Duration | Category | Reasons |",
-        "|---|---|---|---|---|---|",
-    ]
-    for i, e in enumerate(entries, 1):
-        reasons = "; ".join(e.reasons) if e.reasons else "-"
+def _video_report_to_dict(report: VideoScoreReport) -> dict[str, Any]:
+    d = dataclasses.asdict(report)
+    # Rewrite segment values so NaN serialises as the string "NaN"
+    # rather than invalid JSON.
+    for m in d.get("quality_metrics", []):
+        for seg in m.get("segments", []):
+            if isinstance(seg["value"], float) and math.isnan(seg["value"]):
+                seg["value"] = "NaN"
+    return d
+
+
+def _write_video_json(report: VideoScoreReport, path: Path) -> None:
+    path.write_text(json.dumps(_video_report_to_dict(report), indent=2))
+
+
+# ── Per-video markdown ─────────────────────────────────────────────────────
+
+def _render_metadata_table(checks: list[MetadataCheckResult]) -> str:
+    lines = ["| Check | Status | Accepted | Detected |",
+             "|---|---|---|---|"]
+    for c in checks:
         lines.append(
-            f"| {i} | {_fmt_ts(e.start_sec)} | {_fmt_ts(e.end_sec)} | "
-            f"{e.duration:.3f}s | **{e.category}** | {reasons} |"
+            f"| {c.check} | {_fmt_status(c.status)} | {c.accepted} | {c.detected} |"
         )
-    lines.append("")
-    return lines
+    return "\n".join(lines)
 
 
-# ── Review frames (per-video) ────────────────────────────────────────────
-
-
-def _collect_face_review_frames(
-    result: VideoProcessingResult,
-    frame_interval: float,
-) -> list[dict]:
-    """Face-presence review frames from Phase 1 across the whole video."""
-    face_cfr = next(
-        (c for c in result.phase1_check_frame_results
-         if c.check_name == "ml_face_presence"),
-        None,
-    )
-    if face_cfr is None:
-        return []
-
-    records: list[dict] = []
-    for fl in face_cfr.frame_labels:
-        conf = fl.confidence
-        if not (_FACE_REVIEW_LO <= conf < _FACE_REVIEW_HI):
-            continue
-        records.append({
-            "timestamp_sec": fl.timestamp_sec,
-            "confidence": conf,
-        })
-    return records
-
-
-def _collect_segment_review_frames(
-    result: VideoProcessingResult,
-    check_name: str,
-) -> list[dict]:
-    """Aggregate per-segment review_frames from all Phase 2 segments."""
-    records: list[dict] = []
-    for sr in result.segment_results:
-        cr = (sr.check_results or {}).get(check_name)
-        if cr is None:
-            continue
-        records.extend((cr.details or {}).get("review_frames", []))
-    return records
-
-
-def _fmt_triple(agg: tuple[float, float, float] | None, decimals: int = 2) -> str:
-    if agg is None:
-        return "-"
-    mean, lo, hi = agg
-    return f"{mean:.{decimals}f} / {lo:.{decimals}f} / {hi:.{decimals}f}"
-
-
-def _review_run_table(
-    runs: list[ReviewRun],
-    columns: list[tuple[str, str, int]],
-) -> list[str]:
-    """Render a review-runs table.
-
-    columns: list of (header_label, aggregate_key, decimals) for value columns.
-    """
-    headers = ["Start", "End", "Duration", "Frames"] + [c[0] for c in columns]
-    lines = ["| " + " | ".join(headers) + " |"]
-    lines.append("|" + "|".join(["---"] * len(headers)) + "|")
-    for r in runs:
-        row = [
-            _fmt_ts(r.start_sec),
-            _fmt_ts(r.end_sec),
-            f"{r.duration:.3f}s",
-            str(r.frame_count),
-        ]
-        for _label, key, decimals in columns:
-            row.append(_fmt_triple(r.aggregates.get(key), decimals))
-        lines.append("| " + " | ".join(row) + " |")
-    lines.append("")
-    return lines
-
-
-# Per-check display specs: (check_name, value_columns for run table)
-# value_columns: list of (header_label, aggregate_key, decimals)
-_REVIEW_CHECK_SPECS: list[tuple[str, list[tuple[str, str, int]]]] = [
-    ("ml_face_presence", [("Conf (mean / min / max)", "confidence", 2)]),
-    ("ml_hand_visibility", [("Conf (mean / min / max)", "confidence", 2)]),
-    ("ml_hand_object_interaction", [("Conf (mean / min / max)", "confidence", 2)]),
-]
-
-
-def compute_review_runs(
-    result: VideoProcessingResult,
-    frame_interval: float,
-) -> dict[str, list[ReviewRun]]:
-    """Compute per-check review runs (collapsed, > 2s only) for a video."""
-    runs_by_check: dict[str, list[ReviewRun]] = {}
-    for name, columns in _REVIEW_CHECK_SPECS:
-        if name == "ml_face_presence":
-            frames = _collect_face_review_frames(result, frame_interval)
+def _render_technical_table(checks: list[TechnicalCheckResult]) -> str:
+    lines = ["| Check | Status | Accepted | Detected |",
+             "|---|---|---|---|"]
+    for c in checks:
+        if c.skipped or c.status == "skipped":
+            lines.append(f"| {c.check} | SKIPPED | - | - |")
         else:
-            frames = _collect_segment_review_frames(result, name)
-        value_keys = [c[1] for c in columns]
-        runs_by_check[name] = collapse_review_runs(
-            frames,
-            frame_interval=frame_interval,
-            min_duration_s=_REVIEW_MIN_DURATION_S,
-            value_keys=value_keys,
-        )
-    return runs_by_check
+            lines.append(
+                f"| {c.check} | {_fmt_status(c.status)} | {c.accepted} | {c.detected} |"
+            )
+    return "\n".join(lines)
 
 
-def _merge_ranges(
-    ranges: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    """Merge overlapping/touching (start, end) intervals."""
-    if not ranges:
-        return []
-    sorted_ranges = sorted(ranges, key=lambda r: r[0])
-    merged = [sorted_ranges[0]]
-    for start, end in sorted_ranges[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def _union_review_duration(
-    runs_by_check: dict[str, list[ReviewRun]],
-) -> float:
-    """Total review duration across all checks, de-duplicated by time."""
-    ranges: list[tuple[float, float]] = []
-    for runs in runs_by_check.values():
-        for r in runs:
-            ranges.append((r.start_sec, r.end_sec))
-    return sum(end - start for start, end in _merge_ranges(ranges))
-
-
-def _pct(num: float, denom: float) -> float:
-    return (num / denom * 100.0) if denom > 0 else 0.0
-
-
-def _review_section(
-    runs_by_check: dict[str, list[ReviewRun]],
-) -> list[str]:
-    """Render the 'Frames Flagged for Review' section."""
-    lines: list[str] = []
-    if not any(runs_by_check.values()):
-        return lines
-
-    lines.append("---")
-    lines.append("")
-    lines.append("## Frames Flagged for Review")
-    lines.append("")
-    lines.append(
-        f"Contiguous review runs strictly longer than {_REVIEW_MIN_DURATION_S:g}s "
-        "per check. These frames **count as accept** for pass/fail; "
-        "this section is for manual QA only."
-    )
-    lines.append("")
-
-    for name, columns in _REVIEW_CHECK_SPECS:
-        runs = runs_by_check.get(name, [])
-        if not runs:
+def _render_quality_section(metrics: list[QualityMetricResult]) -> str:
+    parts: list[str] = []
+    for m in metrics:
+        parts.append(f"### {m.metric}")
+        if m.skipped:
+            parts.append("SKIPPED")
+            parts.append("")
             continue
-        total_dur = sum(r.duration for r in runs)
-        lines.append(f"### {name} — {len(runs)} range(s), {total_dur:.1f}s")
-        lines.append("")
-        lines.extend(_review_run_table(runs, columns))
-
-    return lines
-
-
-def _hitl_section(
-    runs_by_check: dict[str, list[ReviewRun]],
-    total_duration: float,
-) -> list[str]:
-    """Render the HITL Involvement section.
-
-    Review % = (review duration) / total_duration. Total row uses the union
-    of review ranges across checks so frames flagged by multiple checks are
-    counted once.
-    """
-    lines: list[str] = []
-    union_dur = _union_review_duration(runs_by_check)
-    total_pct = _pct(union_dur, total_duration)
-
-    lines.append("---")
-    lines.append("")
-    lines.append("## HITL Involvement")
-    lines.append("")
-    lines.append(
-        f"**Total Review:** {total_pct:.1f}% "
-        f"({union_dur:.1f}s / {total_duration:.1f}s)"
-    )
-    lines.append("")
-    lines.append("| Check | Review % | Duration |")
-    lines.append("|---|---|---|")
-    for name, _columns in _REVIEW_CHECK_SPECS:
-        runs = runs_by_check.get(name, [])
-        dur = sum(r.duration for r in runs)
-        pct = _pct(dur, total_duration)
-        lines.append(f"| {name} | {pct:.1f}% | {dur:.1f}s |")
-    lines.append("")
-    return lines
+        parts.append(f"- percent_frames: {m.percent_frames:.2f}%")
+        if not m.segments:
+            parts.append("- segments: (none)")
+            parts.append("")
+            continue
+        label = QUALITY_VALUE_LABELS[m.metric]
+        parts.append("")
+        parts.append(f"| start_s | end_s | duration_s | {label} |")
+        parts.append("|---|---|---|---|")
+        for seg in m.segments:
+            parts.append(
+                f"| {seg.start_s:.3f} | {seg.end_s:.3f} | "
+                f"{seg.duration_s:.3f} | {_fmt_value(seg.value)} |"
+            )
+        parts.append("")
+    return "\n".join(parts)
 
 
-# ── Per-video report ─────────────────────────────────────────────────────
+def _render_video_markdown(report: VideoScoreReport) -> str:
+    head = [
+        f"# {report.video_name}",
+        "",
+        f"- generated_at: {report.generated_at}",
+        f"- duration_s: {report.duration_s:.2f}",
+        f"- processing_wall_time_s: {report.processing_wall_time_s:.2f}",
+        "",
+        "## Metadata",
+        "",
+        _render_metadata_table(report.metadata_checks),
+        "",
+        "## Technical",
+        "",
+        _render_technical_table(report.technical_checks),
+        "",
+        "## Quality",
+        "",
+        _render_quality_section(report.quality_metrics),
+    ]
+    return "\n".join(head).rstrip() + "\n"
 
+
+# ── Public: per-video writer ──────────────────────────────────────────────
 
 def write_video_report(
-    result: VideoProcessingResult,
-    output_dir: Path,
-    config: PipelineConfig | None = None,
-) -> Path:
-    """Write a per-video markdown report with a unified timeline view."""
-    report_path = output_dir / "report.md"
-    lines: list[str] = []
+    report: VideoScoreReport,
+    out_dir: str | Path,
+    per_frame_store: PerFrameStore | None = None,
+) -> dict[str, Path]:
+    """Write `report.md`, `{video_name}.json`, and (if applicable) parquet.
 
-    lines.append(f"# Video Report: {result.video_name}")
-    lines.append("")
-    lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ")
-    lines.append(f"**Source:** `{result.video_path}`  ")
-    lines.append(f"**Wall-clock time:** {result.processing_time_sec:.1f}s")
-    lines.append("")
+    Returns the map of artefact name → absolute path actually written.
+    Parquet is skipped when the metadata stage failed (no decode).
+    """
+    video_dir = Path(out_dir) / Path(report.video_name).stem
+    video_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Summary ──────────────────────────────────────────────────────
-    unusable_p1 = sum(s.duration for s in result.phase1_bad_segments)
-    unusable_short = sum(s.duration for s in result.phase1_discarded_segments)
-    rejected_dur = sum(
-        sr.segment.duration for sr in result.segment_results if not sr.passed
-    )
+    md_path = video_dir / "report.md"
+    md_path.write_text(_render_video_markdown(report))
 
-    unusable_total = unusable_p1 + unusable_short
+    json_path = video_dir / f"{Path(report.video_name).stem}.json"
+    _write_video_json(report, json_path)
 
-    lines.append("## Summary")
-    lines.append("")
-    lines.append("| Metric | Value |")
-    lines.append("|---|---|")
-    lines.append(f"| Original duration | {result.original_duration_sec:.1f}s |")
-    lines.append(f"| Usable | {result.usable_duration_sec:.1f}s |")
-    lines.append(f"| Unusable | {unusable_total:.1f}s |")
-    lines.append(f"| Rejected (Phase 2 validation) | {rejected_dur:.1f}s |")
-    lines.append(f"| **Yield** | **{result.yield_ratio:.1%}** |")
-    lines.append(f"| Metadata passed | {'Yes' if result.metadata_passed else 'No'} |")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    paths = {"md": md_path, "json": json_path}
+    if per_frame_store is not None and len(per_frame_store):
+        parquet_path = video_dir / f"{Path(report.video_name).stem}.parquet"
+        per_frame_store.flush(parquet_path)
+        paths["parquet"] = parquet_path
+    return paths
 
-    # ── Phase 0: Metadata ────────────────────────────────────────────
-    lines.append("## Metadata")
-    lines.append("")
-    meta = result.metadata
-    if meta:
+
+# ── Batch: markdown + JSON + CSV ──────────────────────────────────────────
+
+def _render_batch_markdown(batch: BatchScoreReport) -> str:
+    lines = [
+        "# Batch Report",
+        "",
+        f"- generated_at: {batch.generated_at}",
+        f"- video_count: {batch.video_count}",
+        f"- total_duration_s: {batch.total_duration_s:.2f}",
+        f"- total_wall_time_s: {batch.total_wall_time_s:.2f}",
+        "",
+    ]
+
+    lines.extend([
+        "## Metadata check stats",
+        "",
+        "| Check | Pass | Pass duration (s) | Fail | Fail duration (s) | Skipped |",
+        "|---|---|---|---|---|---|",
+    ])
+    for c in METADATA_CHECKS:
+        stats = batch.metadata_check_stats.get(c, CheckStats(0, 0.0, 0, 0.0))
         lines.append(
-            f"**Resolution:** {meta.get('width', '?')}x{meta.get('height', '?')} | "
-            f"**FPS:** {meta.get('fps', '?')} | "
-            f"**Duration:** {meta.get('duration_s', '?')}s | "
-            f"**Codec:** {meta.get('video_codec', '?')} | "
-            f"**Size:** {meta.get('file_size_mb', '?')} MB"
+            f"| {c} | {stats.pass_count} | {stats.pass_duration_s:.2f} | "
+            f"{stats.fail_count} | {stats.fail_duration_s:.2f} | "
+            f"{stats.skipped_count} |"
         )
-        lines.append("")
 
-    lines.append("| Check | Status | Accepted | Observed |")
-    lines.append("|---|---|---|---|")
-    for name, r in result.metadata_results.items():
-        accepted, observed = _meta_accepted_observed(name, r)
-        lines.append(f"| {name} | **{r.status.upper()}** | {accepted} | {observed} |")
-    lines.append("")
-
-    # ── Phase 1: Unusable breakdown ──────────────────────────────────
-    if result.metadata_passed:
-        lines.append("---")
-        lines.append("")
-        lines.append("## Phase 1")
-        lines.append("")
-        lines.append("| Category | Duration | Segments |")
-        lines.append("|---|---|---|")
+    lines.extend([
+        "",
+        "## Technical check stats",
+        "",
+        "| Check | Pass | Pass duration (s) | Fail | Fail duration (s) | Skipped |",
+        "|---|---|---|---|---|---|",
+    ])
+    for c in TECHNICAL_CHECKS:
+        stats = batch.technical_check_stats.get(c, CheckStats(0, 0.0, 0, 0.0))
         lines.append(
-            f"| Unusable (filtered out: face / participants) | "
-            f"{unusable_p1:.1f}s | {len(result.phase1_bad_segments)} |"
+            f"| {c} | {stats.pass_count} | {stats.pass_duration_s:.2f} | "
+            f"{stats.fail_count} | {stats.fail_duration_s:.2f} | "
+            f"{stats.skipped_count} |"
         )
-        lines.append(
-            f"| Unusable (segment too short for Phase 2) | "
-            f"{unusable_short:.1f}s | {len(result.phase1_discarded_segments)} |"
-        )
-        lines.append(f"| **Total unusable** | **{unusable_total:.1f}s** | — |")
-        lines.append("")
 
-    # ── Timeline ─────────────────────────────────────────────────────
-    lines.append("---")
-    lines.append("")
-    lines.append("## Timeline")
-    lines.append("")
-
-    if not result.metadata_passed:
-        # Whole-video REJECTED at the metadata gate.
-        dur = result.original_duration_sec or 0.0
-        entries = [TimelineEntry(
-            start_sec=0.0,
-            end_sec=dur,
-            category="REJECTED",
-            reasons=_metadata_reject_reasons(result.metadata_results),
-        )]
-    else:
-        entries = _build_timeline(result)
-
-    lines.extend(_timeline_table(entries))
-
-    # ── Frames Flagged for Review + HITL Involvement ────────────────
-    if config is not None and result.metadata_passed:
-        frame_interval = 1.0 / config.sampling_fps if config.sampling_fps else 1.0
-        runs_by_check = compute_review_runs(result, frame_interval)
-        lines.extend(_review_section(runs_by_check))
-        lines.extend(_hitl_section(runs_by_check, result.original_duration_sec))
-
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return report_path
-
-
-# ── Batch report ─────────────────────────────────────────────────────────
-
-
-def write_batch_report(
-    all_results: list[VideoProcessingResult],
-    output_dir: Path,
-    config: PipelineConfig,
-    wall_clock_sec: float | None = None,
-) -> Path:
-    """Write a batch-level summary report with topline stats."""
-    report_path = output_dir / "batch_report.md"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines: list[str] = []
-
-    # Topline stats
-    total_original = sum(r.original_duration_sec for r in all_results)
-    total_usable = sum(r.usable_duration_sec for r in all_results)
-    total_unusable = sum(r.unusable_duration_sec for r in all_results)
-    total_yield = total_usable / total_original if total_original > 0 else 0.0
-    total_errors = sum(1 for r in all_results if r.error)
-    total_processing_sec = sum(r.processing_time_sec for r in all_results)
-
-    lines.append("# Batch Report")
-    lines.append("")
-    lines.append(f"**Generated:** {timestamp}  ")
-    lines.append(f"**Videos processed:** {len(all_results)}  ")
-    lines.append(f"**Sampling FPS:** {config.sampling_fps}  ")
-    lines.append(f"**Min segment duration:** {config.min_checkable_segment_sec}s  ")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-
-    # Topline stats table
-    lines.append("## Topline Stats")
-    lines.append("")
-    lines.append("| Metric | Value |")
-    lines.append("|---|---|")
-    lines.append(f"| Total videos | {len(all_results)} |")
-    lines.append(f"| Total original duration | {total_original:.1f}s ({total_original/60:.1f} min) |")
-    lines.append(f"| Total usable footage | {total_usable:.1f}s ({total_usable/60:.1f} min) |")
-    lines.append(f"| Total unusable footage | {total_unusable:.1f}s ({total_unusable/60:.1f} min) |")
-    lines.append(f"| **Total yield** | **{total_yield:.1%}** |")
-    if total_errors:
-        lines.append(f"| Errors | {total_errors} |")
-    lines.append(f"| Total processing time (sum) | {_fmt_duration(total_processing_sec)} |")
-    if wall_clock_sec is not None:
-        lines.append(f"| **Wall-clock time** | **{_fmt_duration(wall_clock_sec)}** |")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-
-    # Per-video summary table
-    lines.append("## Per-Video Summary")
-    lines.append("")
-    lines.append(
-        "| # | Video | Duration | Usable | Unusable | Yield | Status | Time |"
-    )
-    lines.append("|---|---|---|---|---|---|---|---|")
-
-    for idx, r in enumerate(all_results, 1):
-        if r.error:
-            lines.append(
-                f"| {idx} | {r.video_name} | {r.original_duration_sec:.1f}s | "
-                f"- | - | - | ERROR | - |"
-            )
-            continue
-
-        if not r.metadata_passed:
-            status = "META FAIL"
-        elif not r.prefiltered_segments:
-            status = "P1 REJECT"
-        elif r.usable_segments:
-            status = "HAS USABLE"
+    lines.extend([
+        "",
+        "## Quality metric stats (% frames, across non-skipped videos)",
+        "",
+        "| Metric | Mean | Median | Min | Max |",
+        "|---|---|---|---|---|",
+    ])
+    for m in QUALITY_METRICS:
+        qs = batch.quality_metric_stats.get(m)
+        if qs is None:
+            lines.append(f"| {m} | - | - | - | - |")
         else:
-            status = "ALL REJECT"
-
-        lines.append(
-            f"| {idx} | {r.video_name} | {r.original_duration_sec:.1f}s | "
-            f"{r.usable_duration_sec:.1f}s | {r.unusable_duration_sec:.1f}s | "
-            f"{r.yield_ratio:.1%} | {status} | {r.processing_time_sec:.1f}s |"
-        )
-
-    lines.append("")
-
-    # ── Face Presence — per-segment breakdown ────────────────────────
-    face_rows: list[tuple[int, str, int, int, int, float, float]] = []
-    for idx, r in enumerate(all_results, 1):
-        for sr in r.segment_results or []:
-            fp = (sr.check_results or {}).get("ml_face_presence")
-            if not fp or fp.status != "fail":
-                continue
-            d = fp.details or {}
-            face_rows.append((
-                idx,
-                r.video_name,
-                sr.segment.segment_idx,
-                d.get("frames_with_prominent_face", 0),
-                d.get("total_frames", 0),
-                d.get("max_face_confidence_seen", 0.0),
-                d.get("threshold", 0.0),
-            ))
-
-    if face_rows:
-        lines.append("---")
-        lines.append("")
-        lines.append("## Face Presence — Failing Segments")
-        lines.append("")
-        lines.append("Segments rejected because one or more sampled frames contain "
-                     "a face above the confidence threshold.")
-        lines.append("")
-        lines.append(
-            "| # | Video | Segment | Frames w/ Face | Total Frames | Max Face Conf | Threshold |"
-        )
-        lines.append("|---|---|---|---|---|---|---|")
-        for (idx, vname, seg_idx, frames_with, total, max_conf, threshold) in face_rows:
             lines.append(
-                f"| {idx} | {vname} | {seg_idx} | {frames_with} | {total} | "
-                f"{max_conf:.2f} | {threshold} |"
+                f"| {m} | {qs.mean_percent:.2f} | {qs.median_percent:.2f} | "
+                f"{qs.min_percent:.2f} | {qs.max_percent:.2f} |"
             )
-        lines.append("")
 
-    # ── HITL Involvement (batch aggregate) ────────────────────────────
-    frame_interval = 1.0 / config.sampling_fps if config.sampling_fps else 1.0
-    per_check_duration: dict[str, float] = {
-        name: 0.0 for name, _ in _REVIEW_CHECK_SPECS
+    if batch.errors:
+        lines.extend([
+            "",
+            "## Errors",
+            "",
+            "| Video | Reason |",
+            "|---|---|",
+        ])
+        for e in batch.errors:
+            lines.append(f"| {e.video_name} | {e.error_reason} |")
+
+    lines.extend([
+        "",
+        "## Videos",
+        "",
+        "| Video | Duration (s) | Metadata | Technical | Quality |",
+        "|---|---|---|---|---|",
+    ])
+    for v in batch.videos:
+        meta_status = ("FAIL"
+                       if any(c.status == "fail" for c in v.metadata_checks)
+                       else "PASS")
+        if v.technical_skipped:
+            tech_status = "SKIPPED"
+        else:
+            tech_status = ("FAIL"
+                           if any(c.status == "fail" for c in v.technical_checks)
+                           else "PASS")
+        qual_status = "SKIPPED" if v.quality_skipped else "OK"
+        lines.append(
+            f"| {v.video_name} | {v.duration_s:.2f} | "
+            f"{meta_status} | {tech_status} | {qual_status} |"
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _batch_report_to_dict(batch: BatchScoreReport) -> dict[str, Any]:
+    d = dataclasses.asdict(batch)
+    for video in d.get("videos", []):
+        for m in video.get("quality_metrics", []):
+            for seg in m.get("segments", []):
+                if isinstance(seg["value"], float) and math.isnan(seg["value"]):
+                    seg["value"] = "NaN"
+    return d
+
+
+def _render_batch_csv(batch: BatchScoreReport) -> str:
+    """Row per video; two columns per check (status + value) + quality % columns."""
+    rows: list[list[str]] = []
+    header = ["video_name", "duration_s"]
+    for c in METADATA_CHECKS:
+        header.extend([f"meta_{c}_status", f"meta_{c}_value"])
+    for c in TECHNICAL_CHECKS:
+        header.extend([f"tech_{c}_status", f"tech_{c}_value"])
+    for m in QUALITY_METRICS:
+        header.append(f"quality_{m}_pct")
+    rows.append(header)
+
+    for v in batch.videos:
+        row = [v.video_name, f"{v.duration_s:.2f}"]
+        meta_by = {c.check: c for c in v.metadata_checks}
+        for c in METADATA_CHECKS:
+            mc = meta_by.get(c)
+            if mc is None:
+                row.extend(["-", "-"])
+            else:
+                row.extend([_fmt_status(mc.status), mc.detected])
+        tech_by = {t.check: t for t in v.technical_checks}
+        for c in TECHNICAL_CHECKS:
+            tc = tech_by.get(c)
+            if tc is None:
+                row.extend(["-", "-"])
+            elif tc.skipped or tc.status == "skipped":
+                row.extend(["SKIPPED", "-"])
+            else:
+                row.extend([_fmt_status(tc.status), tc.detected])
+        qual_by = {q.metric: q for q in v.quality_metrics}
+        for m in QUALITY_METRICS:
+            q = qual_by.get(m)
+            if q is None or q.skipped:
+                row.append("SKIPPED")
+            else:
+                row.append(f"{q.percent_frames:.2f}")
+        rows.append(row)
+
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def write_batch_report(batch: BatchScoreReport, out_dir: str | Path) -> dict[str, Path]:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    md_path = out / "batch_report.md"
+    md_path.write_text(_render_batch_markdown(batch))
+
+    json_path = out / "batch_results.json"
+    json_path.write_text(json.dumps(_batch_report_to_dict(batch), indent=2))
+
+    csv_path = out / "batch_results.csv"
+    csv_path.write_text(_render_batch_csv(batch))
+
+    return {"md": md_path, "json": json_path, "csv": csv_path}
+
+
+# ── Batch stats aggregation ───────────────────────────────────────────────
+
+def aggregate_batch_stats(
+    videos: list[VideoScoreReport],
+) -> tuple[dict[str, CheckStats], dict[str, CheckStats], dict[str, QualityStats]]:
+    """Fold per-video results into batch-level aggregates."""
+
+    meta_stats: dict[str, CheckStats] = {
+        c: CheckStats(0, 0.0, 0, 0.0) for c in METADATA_CHECKS
     }
-    total_union_duration = 0.0
-    for r in all_results:
-        if r.error or not r.metadata_passed:
+    tech_stats: dict[str, CheckStats] = {
+        c: CheckStats(0, 0.0, 0, 0.0) for c in TECHNICAL_CHECKS
+    }
+    quality_percents: dict[str, list[float]] = {m: [] for m in QUALITY_METRICS}
+
+    for v in videos:
+        for c in v.metadata_checks:
+            slot = meta_stats[c.check]
+            if c.status == "pass":
+                slot.pass_count += 1
+                slot.pass_duration_s += v.duration_s
+            else:
+                slot.fail_count += 1
+                slot.fail_duration_s += v.duration_s
+        for t in v.technical_checks:
+            slot = tech_stats[t.check]
+            if t.skipped or t.status == "skipped":
+                slot.skipped_count += 1
+            elif t.status == "pass":
+                slot.pass_count += 1
+                slot.pass_duration_s += v.duration_s
+            else:
+                slot.fail_count += 1
+                slot.fail_duration_s += v.duration_s
+        for q in v.quality_metrics:
+            if not q.skipped:
+                quality_percents[q.metric].append(q.percent_frames)
+
+    quality_stats: dict[str, QualityStats] = {}
+    for m in QUALITY_METRICS:
+        vals = quality_percents[m]
+        if not vals:
             continue
-        runs_by_check = compute_review_runs(r, frame_interval)
-        for name, runs in runs_by_check.items():
-            per_check_duration[name] += sum(run.duration for run in runs)
-        total_union_duration += _union_review_duration(runs_by_check)
-
-    total_pct = _pct(total_union_duration, total_original)
-
-    lines.append("---")
-    lines.append("")
-    lines.append("## HITL Involvement")
-    lines.append("")
-    lines.append(
-        f"**Total Review:** {total_pct:.1f}% "
-        f"({total_union_duration:.1f}s / {total_original:.1f}s)"
-    )
-    lines.append("")
-    lines.append("| Check | Review % | Duration |")
-    lines.append("|---|---|---|")
-    for name, _columns in _REVIEW_CHECK_SPECS:
-        dur = per_check_duration[name]
-        pct = _pct(dur, total_original)
-        lines.append(f"| {name} | {pct:.1f}% | {dur:.1f}s |")
-    lines.append("")
-
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return report_path
+        quality_stats[m] = QualityStats(
+            mean_percent=round(statistics.fmean(vals), 2),
+            median_percent=round(statistics.median(vals), 2),
+            min_percent=round(min(vals), 2),
+            max_percent=round(max(vals), 2),
+        )
+    return meta_stats, tech_stats, quality_stats

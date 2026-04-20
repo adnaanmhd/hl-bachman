@@ -25,10 +25,17 @@ dependencies = [
     "scipy",
     "pyyaml",
     "cython",
+    "pyarrow>=15.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [project.scripts]
-hl-validate = "bachman_cortex.run_batch:main"
+hl-score = "bachman_cortex.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["bachman_cortex*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

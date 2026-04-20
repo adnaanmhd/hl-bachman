@@ -1,112 +1,105 @@
-"""Pixelation detection via block boundary gradient ratio.
+"""Pixelation (block-boundary gradient ratio) accumulator.
 
-Measures the ratio of gradient energy at 8x8 block boundaries vs. interior
-positions. Compression artifacts and upscaled low-res sources produce
-artificially strong edges at block boundaries, yielding a ratio >> 1.0.
+Measures per-frame blockiness: ratio of average gradient magnitude at
+8x8 block boundaries vs. block interiors. Compression artefacts and
+upscaled low-res sources produce blockiness >> 1.0.
 
-Video-level: pass if mean blockiness score <= threshold.
+Fails the video if fewer than `good_frame_ratio` of sampled frames
+land below `max_blockiness_ratio`.
 """
+
+from __future__ import annotations
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from bachman_cortex.checks.check_results import CheckResult
+
+@dataclass(frozen=True)
+class PixelationThresholds:
+    good_frame_ratio: float = 0.80
+    max_blockiness_ratio: float = 1.5
+    block_size: int = 8
 
 
 @dataclass
-class PixelationConfig:
-    """Thresholds for pixelation detection."""
-    # Block size to check (8 = H.264/HEVC sub-block)
-    block_size: int = 8
-
-    # Blockiness ratio above this = pixelated frame
-    pixelation_threshold: float = 1.5
-
-    # Video-level: fraction of frames that must be non-pixelated
-    min_good_ratio: float = 0.80
+class PixelationFinalizeResult:
+    pass_fail: bool
+    detected: str
+    ratio_array: list[float]       # per-sampled-frame
+    sample_indices: list[int]
+    good_ratio: float
+    mean_blockiness: float
 
 
-def compute_blockiness(frame: np.ndarray, block_size: int = 8) -> float:
-    """Compute blockiness score for a single frame.
+def compute_blockiness(frame_bgr: np.ndarray, block_size: int = 8) -> float:
+    """Ratio of gradient energy at block boundaries vs. interior.
 
-    Measures the ratio of average gradient magnitude at block boundaries
-    vs. interior positions. Returns ratio >= 0.0; values near 1.0 indicate
-    no block artifacts, values >> 1.0 indicate pixelation.
+    ~1.0 → no block artefacts, >> 1.0 → pixelation.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     h, w = gray.shape
 
-    # Horizontal gradients: |I(x+1, y) - I(x, y)|
-    h_grad = np.abs(np.diff(gray, axis=1))  # shape (h, w-1)
+    h_grad = np.abs(np.diff(gray, axis=1))
+    v_grad = np.abs(np.diff(gray, axis=0))
 
-    # Vertical gradients: |I(x, y+1) - I(x, y)|
-    v_grad = np.abs(np.diff(gray, axis=0))  # shape (h-1, w)
-
-    # Horizontal boundary columns: positions where x % block_size == 0
-    # (these are the left edges of each block)
     h_boundary_cols = np.arange(block_size - 1, w - 1, block_size)
     h_interior_mask = np.ones(w - 1, dtype=bool)
     h_interior_mask[h_boundary_cols] = False
 
-    h_boundary_energy = float(np.mean(h_grad[:, h_boundary_cols])) if len(h_boundary_cols) > 0 else 0.0
-    h_interior_energy = float(np.mean(h_grad[:, h_interior_mask])) if h_interior_mask.any() else 1.0
+    h_boundary_energy = (float(np.mean(h_grad[:, h_boundary_cols]))
+                         if len(h_boundary_cols) > 0 else 0.0)
+    h_interior_energy = (float(np.mean(h_grad[:, h_interior_mask]))
+                         if h_interior_mask.any() else 1.0)
 
-    # Vertical boundary rows
     v_boundary_rows = np.arange(block_size - 1, h - 1, block_size)
     v_interior_mask = np.ones(h - 1, dtype=bool)
     v_interior_mask[v_boundary_rows] = False
 
-    v_boundary_energy = float(np.mean(v_grad[v_boundary_rows, :])) if len(v_boundary_rows) > 0 else 0.0
-    v_interior_energy = float(np.mean(v_grad[v_interior_mask, :])) if v_interior_mask.any() else 1.0
+    v_boundary_energy = (float(np.mean(v_grad[v_boundary_rows, :]))
+                         if len(v_boundary_rows) > 0 else 0.0)
+    v_interior_energy = (float(np.mean(v_grad[v_interior_mask, :]))
+                         if v_interior_mask.any() else 1.0)
 
-    boundary_energy = (h_boundary_energy + v_boundary_energy) / 2.0
-    interior_energy = (h_interior_energy + v_interior_energy) / 2.0
+    boundary = (h_boundary_energy + v_boundary_energy) / 2.0
+    interior = (h_interior_energy + v_interior_energy) / 2.0
+    return boundary / (interior + 1e-6)
 
-    return boundary_energy / (interior_energy + 1e-6)
 
+@dataclass
+class PixelationAccumulator:
+    thresholds: PixelationThresholds = field(default_factory=PixelationThresholds)
 
-def check_pixelation(
-    frames: list[np.ndarray],
-    config: PixelationConfig | None = None,
-    timestamps: list[float] | None = None,
-) -> CheckResult:
-    """Run pixelation detection on sampled frames.
+    _ratios: list[float] = field(init=False, default_factory=list)
+    _sample_indices: list[int] = field(init=False, default_factory=list)
 
-    Pass if non-pixelated frames >= min_good_ratio of total.
-    """
-    cfg = config or PixelationConfig()
+    def process_frame(self, frame_720p: np.ndarray, frame_idx: int) -> None:
+        ratio = compute_blockiness(frame_720p, self.thresholds.block_size)
+        self._ratios.append(ratio)
+        self._sample_indices.append(frame_idx)
 
-    if not frames:
-        return CheckResult(status="fail", metric_value=0.0, confidence=1.0,
-                           details={"error": "no frames"})
+    def finalize(self) -> PixelationFinalizeResult:
+        th = self.thresholds
+        n = len(self._ratios)
+        if n == 0:
+            return PixelationFinalizeResult(
+                pass_fail=False,
+                detected="no_samples",
+                ratio_array=[],
+                sample_indices=[],
+                good_ratio=0.0,
+                mean_blockiness=0.0,
+            )
 
-    scores = []
-    pixelated_frames = 0
-    for i, frame in enumerate(frames):
-        score = compute_blockiness(frame, cfg.block_size)
-        scores.append(score)
-        if score > cfg.pixelation_threshold:
-            pixelated_frames += 1
-
-    total = len(frames)
-    good_ratio = (total - pixelated_frames) / total
-    mean_score = float(np.mean(scores))
-    status = "pass" if good_ratio >= cfg.min_good_ratio else "fail"
-
-    return CheckResult(
-        status=status,
-        metric_value=round(good_ratio, 4),
-        confidence=1.0,
-        details={
-            "mean_blockiness": round(mean_score, 4),
-            "max_blockiness": round(float(np.max(scores)), 4),
-            "min_blockiness": round(float(np.min(scores)), 4),
-            "pixelated_frames": pixelated_frames,
-            "total_frames": total,
-            "good_ratio": round(good_ratio, 4),
-            "min_good_ratio": cfg.min_good_ratio,
-            "pixelation_threshold": cfg.pixelation_threshold,
-            "block_size": cfg.block_size,
-        },
-    )
+        good = sum(1 for r in self._ratios if r <= th.max_blockiness_ratio)
+        good_ratio = good / n
+        passes = good_ratio >= th.good_frame_ratio
+        mean = float(np.mean(self._ratios))
+        return PixelationFinalizeResult(
+            pass_fail=passes,
+            detected=f"good_ratio={good_ratio:.3f}, mean={mean:.3f}",
+            ratio_array=list(self._ratios),
+            sample_indices=list(self._sample_indices),
+            good_ratio=round(good_ratio, 4),
+            mean_blockiness=round(mean, 4),
+        )
