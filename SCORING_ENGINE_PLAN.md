@@ -540,7 +540,7 @@ rows):
 | `b_frames`         | `Y` / `N`     | `has_b_frames > 0` |
 | `hdr`              | `ON` / `OFF`  | `color_transfer ∈ {smpte2084, arib-std-b67}` OR Dolby Vision side-data / codec tag. BT.2020 primaries alone are not HDR |
 | `stabilization`    | `Y` / `N` / `Unknown` | Device-agnostic vendor registry (priority order): gyroflow/ReelSteady → GoPro (encoder + GPMD) → Google CAMM track → Samsung `smta`/`svss` → DJI → Apple (`Unknown`) → `Unknown`. `N` is reserved for explicit off-signals (rare); absence resolves to `Unknown` |
-| `fov`              | string        | Vendor registry: GoPro / DJI return `{vendor}-embedded` until the KLV parser lands (paired with IMU extraction); Apple derives `~{deg}°` from the 35mm-equiv focal-length tag; else `Unknown` |
+| `fov`              | string        | GoPro: real lens label (Wide / Linear / SuperView / …) plus horizontal degrees via the GPMF Highlights scanner (`utils/gpmd.py`), e.g. `"Wide (~133°)"`. DJI still returns `DJI-embedded` (registry placeholder until the `udta` parser lands). Apple derives `~{deg}°` from the 35mm-equiv focal-length tag. Else `Unknown` |
 
 Full rule text and registry priorities live in `checks.md`.
 
@@ -571,10 +571,10 @@ tuples `METADATA_OBSERVATIONS`, `METADATA_OBSERVATION_NUMERIC`,
 
 - `bachman_cortex/utils/metadata_observations.py` — pure extractors
   + `build_observations()` + vendor registry.
-- `bachman_cortex/utils/gpmd.py` — GoPro GPMD timed-metadata stream
-  detection stub; the real KLV parser lands with the IMU extraction
-  work and plugs into this module without changing the observations
-  pipeline.
+- `bachman_cortex/utils/gpmd.py` — GoPro GPMD presence detector plus
+  the GPMF Highlights scanner. Extracts camera model, lens label,
+  horizontal FOV, and HyperSmooth state; consumed by the stabilization
+  and FOV registries.
 - `bachman_cortex/utils/video_metadata.py` — `get_avg_gop()` +
   `collect_tag_surface()` added. Backward-compatible: the existing
   `get_video_metadata()` return dict gained fields, no existing keys
@@ -585,6 +585,139 @@ because the reading is intended as a video-quality signal, not a
 file-on-disk signal. HDR rule intentionally rejects BT.2020 primaries
 alone (seen in UHD SDR masters). `Unknown` is a first-class value —
 reporting `N` in the absence of a signal would be a lossy false
-negative. FOV intentionally returns `{vendor}-embedded` placeholders
-for GoPro/DJI so the presence of richer data is reflected even before
-the KLV parser lands.
+negative. FOV / stabilization resolve to the real parsed values for
+GoPro once the GPMF Highlights scanner lands (§11.2); DJI continues
+to return a `DJI-embedded` placeholder until the `udta` parser lands.
+
+### 11.2 Capture device + IMU extraction (2026-04-21)
+
+Two new non-gating extractions, recorded alongside the seven
+observations of §11.1. Both run unconditionally — even for
+metadata-failed videos — because neither decodes the video. Both
+populate new top-level sections on `VideoScoreReport`, not fields on
+`MetadataObservations`.
+
+**Fields.**
+
+| Field              | Type / format                        | Source |
+| ------------------ | ------------------------------------ | ------ |
+| `device_type`      | `ext_camera` / `phone` / `Unknown`   | Vendor registry (below) |
+| `device_model`     | combined string or `Unknown`         | Vendor registry |
+| `imu.present`      | bool                                 | `Y` only when BOTH gyroscope and accelerometer streams parse via `telemetry-parser` |
+| `imu.accel_hz`     | float (Hz) or `None`                 | Mean accelerometer rate across the whole video, 1 decimal |
+| `imu.gyro_hz`      | float (Hz) or `None`                 | Mean gyroscope rate across the whole video, 1 decimal |
+
+Full rule text and registry priorities live in `checks.md`.
+
+**Device registry** (first match wins):
+
+1. `telemetry-parser` surfaces `.camera` / `.model` — covers GoPro,
+   Sony, Insta360, DJI, Blackmagic RAW, RED RAW. Always maps to
+   `ext_camera` (those vendors never ship phones).
+2. `com.apple.quicktime.model` → `phone`, `"Apple {model}"`.
+3. `com.apple.quicktime.*` present but no model → `phone`, `Unknown`.
+4. `com.android.manufacturer` + `com.android.model` → `phone`,
+   `"{mfr} {model}"`.
+5. Any `com.android.*` present but no model → `phone`, `Unknown`.
+6. Else → `Unknown`, `Unknown`.
+
+**Data model.** Two new dataclasses in `data_types.py`:
+
+```python
+@dataclass
+class CaptureDevice:
+    device_type: str
+    device_model: str
+
+@dataclass
+class ImuInfo:
+    present: bool
+    accel_hz: float | None
+    gyro_hz: float | None
+```
+
+Both attached as optional fields to `VideoScoreReport`. Canonical
+tuples `CAPTURE_DEVICE_FIELDS`, `IMU_FIELDS` drive CSV-column
+ordering.
+
+**Output artefacts.** Added surfaces — no existing schema broken:
+
+- Per-video `report.md`: new `## Capture device` and `## IMU`
+  sections between `## Metadata observations` and `## Technical`.
+- Per-video `{video}.json`: new top-level `capture_device` and `imu`
+  keys with native booleans / numerics.
+- Per-video IMU CSVs — **only when `imu.present=True`** — written
+  next to `report.md`:
+  - `{video_stem}_accel.csv`  — columns `timestamp_s, ax, ay, az` (m/s²).
+  - `{video_stem}_gyro.csv`   — columns `timestamp_s, gx, gy, gz` (rad/s).
+  Each CSV preserves its sensor's native cadence (no resampling, no
+  NaN-fill alignment rows). Single-sensor containers report
+  `imu_present=N` and write no CSV.
+- Batch `batch_results.csv`: five new trailing columns — `device_type`,
+  `device_model`, `imu_present`, `imu_accel_hz`, `imu_gyro_hz` — after
+  the `meta_*` observation columns.
+- Batch `batch_report.md`: new `## Capture device (aggregate)` section
+  (distribution histograms for `device_type` and `device_model`) plus
+  `## IMU (aggregate)` section (`imu_present` histogram + mean / median
+  / min / max for `imu_accel_hz` / `imu_gyro_hz` computed only over
+  videos with `imu_present=Y`).
+- Parquet: unchanged. Device + IMU summaries are one-per-video, not
+  per-frame; raw IMU samples live in the sibling CSV files.
+
+**Module additions:**
+
+- `bachman_cortex/utils/device_info.py` — vendor registry for
+  `device_type` / `device_model`; uses `telemetry-parser` then ffprobe
+  tags.
+- `bachman_cortex/utils/imu_extraction.py` — wraps
+  `telemetry_parser.Parser.normalized_imu()`; enforces the
+  both-sensors-present rule; returns per-sensor sample lists + mean
+  rates in SI units.
+- `bachman_cortex/utils/imu_csv.py` — writes the two per-sensor CSVs.
+- `bachman_cortex/utils/gpmd.py` — expanded from §11.1 stub to a real
+  GPMF Highlights scanner. Decodes `VFOV` / `ZFOV` (lens preset +
+  horizontal FOV degrees), `HSGT` / `EISA` / `EISE` (HyperSmooth state),
+  and `DVNM` / internal model names. Consumed by the stabilization
+  and FOV registries to return real values instead of the §11.1
+  placeholders.
+
+**Engine wiring.** `ScoringEngine.score_video` now returns
+`(report, store, imu_samples)`. The device + IMU + GPMF extractions
+run before the metadata gate so metadata-failed videos still carry
+populated `capture_device` and `imu` fields (and IMU CSVs when
+sensors are present). `batch.py` unpacks the new tuple and forwards
+`imu_samples` to `write_video_report`.
+
+**Updates to §11.1 registries** (non-breaking):
+
+- `stabilization` now consumes `parse_gpmd_highlights().hypersmooth_state`
+  as its highest-priority signal. Returns `N` when HSGT / EISA / EISE
+  indicates `OFF` / `N`. Previous behaviour treated GoPro GPMD
+  presence as `Y` unconditionally — that was a false positive for
+  clips recorded with HyperSmooth disabled, now fixed.
+- `fov` now returns real lens labels (`"Wide (~133°)"` etc.) for
+  GoPro. The `GoPro-embedded` placeholder is retained as a fallback
+  when the Highlights block fails to parse.
+
+**Dependency.** `telemetry-parser >= 0.3.0` (Rust-compiled wheel;
+supports GoPro / CAMM / Sony / Insta360 / DJI / Blackmagic / RED /
+several Android sensor-logger apps). Added to `pyproject.toml` +
+`bachman_cortex/requirements.txt`.
+
+**Re-encoded-file caveat.** ffmpeg retranscode strips
+`com.apple.quicktime.*`, `com.android.*`, and GoPro GPMD streams.
+Re-encoded clips read as `device_type=Unknown, device_model=Unknown,
+imu_present=N`. Documented in `checks.md` and `CONTEXT.md §4`. Run
+the engine against the original file when device / IMU data matters
+downstream.
+
+**Rationale notes.** `ext_camera` collapses action cams, mirrorless
+/ DSLR, and drones into one bucket because the downstream consumer
+(dataset selection) cares about "embedded-IMU-bearing capture device"
+vs. "pocket phone" more than finer granularity. `imu_present=Y`
+requires both sensors by design — a single-axis acceleration log is
+rarely useful on its own, and reporting `Y` with a half-populated
+CSV pair was worse ambiguity than reporting `N`. CSVs at native
+cadence (no resampling) keep the extraction lossless and push any
+alignment concerns to downstream analysis code that already has
+opinions about them.

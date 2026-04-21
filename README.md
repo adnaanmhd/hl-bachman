@@ -77,10 +77,35 @@ those that fail the metadata gate.
 | color_depth_bits   | 8 / 10 / 12, from `bits_per_raw_sample` with `pix_fmt` fallback.             |
 | b_frames           | `Y` / `N`, from ffprobe `has_b_frames`.                                      |
 | hdr                | `ON` / `OFF`. ON iff `color_transfer ∈ {smpte2084, arib-std-b67}`, or a Dolby Vision signal is present (side-data record or codec tag in {`dvhe`, `dvav`, `dvh1`, `dva1`}). BT.2020 primaries alone do not qualify. |
-| stabilization      | `Y` / `N` / `Unknown`, from a device-agnostic vendor registry (gyroflow/ReelSteady in encoder tag, GoPro encoder, Google CAMM track, Samsung `smta`/`svss` atoms, DJI markers, Apple software tag → `Unknown`). |
-| fov                | Raw vendor label or `Unknown`. GoPro / DJI return placeholder `{vendor}-embedded` pending the GPMD / `udta` KLV parser (next task). Apple iPhone computes `~{deg}°` from the 35mm-equivalent focal length tag when present. |
+| stabilization      | `Y` / `N` / `Unknown`. Parsed GoPro HyperSmooth state is authoritative; falls back to the device-agnostic vendor registry (gyroflow/ReelSteady encoder tag, GoPro / CAMM / Samsung / DJI markers, Apple software tag → `Unknown`). |
+| fov                | Parsed GoPro lens label ("Wide", "Linear", …) with horizontal degrees, e.g. `"Wide (~133°)"`. DJI still returns `DJI-embedded` (registry placeholder). Apple iPhone computes `~{deg}°` from the 35mm-equivalent focal length tag when present. `Unknown` otherwise. |
 
 See [`checks.md`](checks.md) for the exact detection rules and registry.
+
+### Stage 1.6 — Capture device + IMU (non-gating)
+
+Every video also records the capture device and (if available) an
+IMU stream. These are pure extractions — no pass/fail, no gating
+effect — and run even for metadata-failed videos.
+
+| Field           | Values                                    | Source                                                                                         |
+| --------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| device_type     | `ext_camera` / `phone` / `Unknown`        | `telemetry-parser` vendor match → `ext_camera`; Apple / Android tags → `phone`; else `Unknown`. |
+| device_model    | combined string or `Unknown`              | `{camera} {model}` from telemetry-parser; `"Apple iPhone N"` / `"{mfr} {model}"` from ffprobe. |
+| imu_present     | `Y` / `N`                                 | `Y` only when BOTH gyroscope and accelerometer streams parse. Malformed or absent → `N`.        |
+| imu_accel_hz    | float Hz or `-`                           | Mean rate across the accelerometer stream.                                                      |
+| imu_gyro_hz     | float Hz or `-`                           | Mean rate across the gyroscope stream.                                                          |
+
+When `imu_present=Y`, two CSVs are written next to `report.md`:
+
+- `{video_stem}_accel.csv` — `timestamp_s, ax, ay, az` (m/s²), native cadence.
+- `{video_stem}_gyro.csv`  — `timestamp_s, gx, gy, gz` (rad/s), native cadence.
+
+**Re-encoded caveat:** ffmpeg retranscoding (including the default
+NVENC lossless path under `scripts/`) strips `com.apple.quicktime.*`,
+`com.android.*`, and GoPro `GPMD` streams. Re-encoded clips read as
+`device_type=Unknown, device_model=Unknown, imu_present=N`. Run the
+engine against the original file if device / IMU columns matter.
 
 ### Stage 2 — Technical
 
@@ -124,7 +149,9 @@ results/run_NNN/
 ├── {video_name}/
 │   ├── report.md
 │   ├── {video_name}.json
-│   └── {video_name}.parquet     # omitted if metadata failed
+│   ├── {video_name}.parquet        # omitted if metadata failed
+│   ├── {video_stem}_accel.csv      # only when imu_present=Y
+│   └── {video_stem}_gyro.csv       # only when imu_present=Y
 ├── batch_report.md
 ├── batch_results.json
 └── batch_results.csv
@@ -232,7 +259,10 @@ hl-bachman/
         ├── frame_extractor.py       # iter_native_frames (NVDEC/cv2 generator).
         ├── video_metadata.py        # ffprobe wrapper + avg-GOP scan.
         ├── metadata_observations.py # Seven non-gating metadata observations + vendor registry.
-        └── gpmd.py                  # GoPro GPMD timed-metadata stub (real KLV parser lands with IMU work).
+        ├── gpmd.py                  # GPMF presence detector + Highlights scanner (lens / HyperSmooth / model).
+        ├── device_info.py           # Capture-device registry (ext_camera / phone / Unknown).
+        ├── imu_extraction.py        # telemetry-parser wrapper → (accel, gyro) samples + rates.
+        └── imu_csv.py               # Writes {stem}_accel.csv + {stem}_gyro.csv.
 ```
 
 ---

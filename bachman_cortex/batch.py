@@ -144,7 +144,7 @@ def score_batch(
 
     for video in videos:
         try:
-            report, store = engine.score_video(video)
+            report, store, imu_samples = engine.score_video(video)
         except Exception as exc:
             reason = _classify_error(exc)
             log.exception("scoring failed: %s (%s)", video.name, reason)
@@ -156,7 +156,11 @@ def score_batch(
             continue
 
         try:
-            write_video_report(report, run_dir, per_frame_store=store)
+            write_video_report(
+                report, run_dir,
+                per_frame_store=store,
+                imu_samples=imu_samples,
+            )
         except Exception:
             log.exception("failed to write per-video report for %s", video.name)
             errors.append(ProcessingErrorReport(

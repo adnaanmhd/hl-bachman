@@ -19,7 +19,10 @@ from pathlib import Path
 
 from bachman_cortex.data_types import (
     BatchScoreReport,
+    CaptureDevice,
+    ImuInfo,
     MetadataCheckResult,
+    MetadataObservations,
     QualityMetricResult,
     QualitySegment,
     TechnicalCheckResult,
@@ -34,6 +37,24 @@ def _seg_value(raw):
     return raw
 
 
+def _load_observations(raw: dict | None) -> MetadataObservations | None:
+    if not raw:
+        return None
+    return MetadataObservations(**raw)
+
+
+def _load_capture_device(raw: dict | None) -> CaptureDevice | None:
+    if not raw:
+        return None
+    return CaptureDevice(**raw)
+
+
+def _load_imu(raw: dict | None) -> ImuInfo | None:
+    if not raw:
+        return None
+    return ImuInfo(**raw)
+
+
 def _load_report(path: Path) -> VideoScoreReport:
     d = json.loads(path.read_text())
     return VideoScoreReport(
@@ -43,6 +64,9 @@ def _load_report(path: Path) -> VideoScoreReport:
         processing_wall_time_s=d["processing_wall_time_s"],
         duration_s=d["duration_s"],
         metadata_checks=[MetadataCheckResult(**c) for c in d.get("metadata_checks", [])],
+        metadata_observations=_load_observations(d.get("metadata_observations")),
+        capture_device=_load_capture_device(d.get("capture_device")),
+        imu=_load_imu(d.get("imu")),
         technical_checks=[TechnicalCheckResult(**c) for c in d.get("technical_checks", [])],
         quality_metrics=[
             QualityMetricResult(

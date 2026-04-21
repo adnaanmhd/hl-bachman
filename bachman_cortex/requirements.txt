@@ -42,3 +42,6 @@ cython
 # Grounding DINO (HuggingFace variant)
 transformers>=4.36.0
 supervision>=0.18.0
+
+# IMU + device-info extraction (GoPro / CAMM / DJI / Insta360 / Sony / Android)
+telemetry-parser>=0.3.0

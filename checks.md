@@ -72,6 +72,7 @@ false negative).
 
 | Priority | Vendor / signal          | Detector                                                                                    | Returns   |
 | -------- | ------------------------ | ------------------------------------------------------------------------------------------- | --------- |
+| 0        | GPMF HyperSmooth state   | `parse_gpmd_highlights` returns `hypersmooth_state` from `HSGT` / `EISA` / `EISE` FourCC keys | `N` when state is `OFF` / `N` / `NO`; `Y` otherwise |
 | 1        | gyroflow / ReelSteady    | video-stream `encoder` tag matches `\b(gyroflow\|reelsteady\|hypersmooth)\b`                 | `Y`       |
 | 2a       | GoPro                    | `encoder` contains `gopro`                                                                   | `Y`       |
 | 2b       | GoPro (GPMD track)       | any stream has `handler_name` containing `gopro met` or `gpmd`, or `codec_tag_string=gpmd`   | `Y`       |
@@ -88,16 +89,15 @@ Same ordering principle. Most containers carry no FOV signal, so
 
 | Priority | Vendor       | Detector                                                  | Returns                              |
 | -------- | ------------ | --------------------------------------------------------- | ------------------------------------ |
-| 1        | GoPro        | GPMD stream present, or `encoder` contains `gopro`        | `GoPro-embedded` (placeholder until the GPMD KLV parser lands with IMU extraction) |
-| 2        | DJI          | `encoder`/`handler_name` contains `dji`                   | `DJI-embedded` (placeholder until the `udta` parser lands)                         |
-| 3        | Apple iPhone | `com.apple.quicktime.focal.length.35mmEquiv` tag present  | `~{deg}°` computed from 35mm-equivalent focal length via `HFOV = 2·atan(36 / 2f)`  |
+| 0        | GoPro (parsed) | `parse_gpmd_highlights` returns `lens_label` from `VFOV` FourCC (`W`/`L`/`S`/`N`/`H`) and optional `ZFOV` degrees | `"{label} (~{deg}°)"` or just `"{label}"` (e.g. `"Wide (~133°)"`) |
+| 1        | GoPro (presence fallback) | GPMD stream present, or `encoder` contains `gopro`, but scanner could not parse settings | `GoPro-embedded` |
+| 2        | DJI          | `encoder`/`handler_name` contains `dji`                   | `DJI-embedded` (placeholder until the `udta` parser lands) |
+| 3        | Apple iPhone | `com.apple.quicktime.focal.length.35mmEquiv` tag present  | `~{deg}°` computed from 35mm-equivalent focal length via `HFOV = 2·atan(36 / 2f)` |
 | —        | no match     | —                                                         | `Unknown`                            |
 
-GoPro / DJI currently return the `{vendor}-embedded` sentinel rather
-than the actual lens preset — the real KLV parser for the GPMD /
-`udta` streams is the next piece of work (paired with IMU extraction).
-When it lands, this registry promotes the sentinel to the real label
-without touching anything else.
+DJI still returns the `DJI-embedded` sentinel — the `udta` parser
+covering DJI camera / drone footage is a separate follow-up. GoPro
+now resolves the real lens preset label via the GPMF Highlights scan.
 
 ### Where these appear
 
@@ -113,6 +113,105 @@ without touching anything else.
   sub-table (distribution histogram for `b_frames`, `hdr`,
   `stabilization`, `fov`). Per-video rows in the batch MD stay
   summary-only.
+
+---
+
+## Capture device (non-gating)
+
+Every video records the make/model of the capture device. Pure
+extraction — no pass/fail, no effect on stage gating.
+
+| Field         | Values                             | Source rule                                                                                                 |
+| ------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| device_type   | `ext_camera` / `phone` / `Unknown` | Registry (below). `ext_camera` covers action cams (GoPro / DJI / Insta360), mirrorless / DSLR (Sony / Blackmagic / RED), and drones. |
+| device_model  | combined string or `Unknown`       | Registry (below).                                                                                            |
+
+### Device registry
+
+Priority order, first match wins:
+
+| Priority | Vendor                     | Detector                                                                    | `device_type` | `device_model`                          |
+| -------- | -------------------------- | --------------------------------------------------------------------------- | ------------- | --------------------------------------- |
+| 1        | telemetry-parser supported | `telemetry_parser.Parser(path)` surfaces `.camera` / `.model` (GoPro, Sony, Insta360, DJI, Blackmagic, RED) | `ext_camera`  | `"{camera} {model}"` or just `{model}`  |
+| 2        | Apple (full tags)          | `com.apple.quicktime.model` present                                          | `phone`       | `"Apple {model}"`                       |
+| 3        | Apple (partial tags)       | any `com.apple.quicktime.*` key present, model missing                       | `phone`       | `Unknown`                               |
+| 4        | Android (full tags)        | `com.android.manufacturer` + `com.android.model` both present                | `phone`       | `"{manufacturer} {model}"`              |
+| 5        | Android (partial tags)     | only `com.android.version` or another `com.android.*` key present            | `phone`       | `Unknown`                               |
+| —        | no match                   | —                                                                           | `Unknown`     | `Unknown`                               |
+
+### Where these appear
+
+- Per-video `report.md`: `## Capture device` section with a 2-row table.
+- Per-video `{video}.json`: top-level `capture_device` key (`{"device_type": ..., "device_model": ...}`).
+- Batch `batch_results.csv`: `device_type`, `device_model` columns.
+- Batch `batch_report.md`: `## Capture device (aggregate)` distribution histograms.
+
+---
+
+## IMU (non-gating)
+
+Every video is probed for an Inertial Measurement Unit stream. When
+present, accelerometer and gyroscope samples are dumped to CSV
+alongside the report.
+
+| Field             | Values                         | Source rule                                                                                 |
+| ----------------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
+| imu_present       | `Y` / `N`                      | `Y` requires BOTH gyroscope AND accelerometer streams to parse successfully. Single-sensor containers → `N`. Malformed-KLV / unsupported-format → `N`. |
+| imu_accel_hz      | float (Hz) or `-`              | Mean sampling rate across the whole video, 1 decimal. `None` / `-` when `imu_present=N`.     |
+| imu_gyro_hz       | float (Hz) or `-`              | Same, for the gyroscope stream.                                                              |
+
+### Source
+
+`telemetry-parser` (Rust wheel; supports GoPro GPMF, Google CAMM,
+Sony, Insta360, DJI, Blackmagic RAW, RED RAW, and several Android
+sensor-logger apps). Units are already SI: m/s² for accelerometer,
+rad/s for gyroscope — no unit conversion in our code.
+
+### CSV artefacts
+
+When `imu_present=Y`, two files are written into the per-video
+directory alongside `report.md`:
+
+- `{video_stem}_accel.csv` — columns `timestamp_s, ax, ay, az` (m/s²).
+- `{video_stem}_gyro.csv`  — columns `timestamp_s, gx, gy, gz` (rad/s).
+
+Each CSV preserves its sensor's native cadence — no resampling, no
+interpolation, no NaN-filled alignment rows. Rates may differ
+between the two files when the source container ships asymmetric
+sensor rates.
+
+When `imu_present=N`, NO CSV is written (no half-populated pair).
+
+### Where these appear
+
+- Per-video `report.md`: `## IMU` section (3-row table).
+- Per-video `{video}.json`: top-level `imu` key (`{"present": true, "accel_hz": 202.7, "gyro_hz": 202.7}`).
+- Batch `batch_results.csv`: `imu_present`, `imu_accel_hz`, `imu_gyro_hz` columns.
+- Batch `batch_report.md`: `## IMU (aggregate)` — `imu_present` distribution + mean/median/min/max for accel / gyro Hz across `imu_present=Y` videos.
+
+---
+
+## Re-encoded input caveat
+
+Any ffmpeg retranscode (including the default NVENC lossless path
+under `scripts/` / `validate.sh`) strips almost all device-identifying
+metadata:
+
+- `com.apple.quicktime.*` tags → removed.
+- `com.android.*` tags → removed.
+- GoPro GPMD timed-metadata stream → removed (ffmpeg drops unknown
+  `meta` streams by default).
+
+Re-encoded clips therefore read as:
+
+- `stabilization = Unknown`, `fov = Unknown`
+- `device_type = Unknown`, `device_model = Unknown`
+- `imu_present = N` (no CSVs written)
+
+If you need accurate capture-device / IMU data, run the engine on the
+original file. The re-encoded output is fine for vision-pipeline work
+(luminance / stability / quality) but the capture-metadata columns
+for those rows will all be `Unknown`.
 
 ---
 
@@ -171,12 +270,13 @@ Runs shorter than `merge_threshold_s` (default 1.0s) absorb into their preceding
 
 Per video:
 
-- `report.md` — human-readable Markdown tables (`## Metadata`, `## Metadata observations`, `## Technical`, `## Quality`).
-- `{video_name}.json` — same content as MD but structured, JSON-safe (NaN serialised as the string `"NaN"`). Observations live under `metadata_observations`.
-- `{video_name}.parquet` — one row per native frame, dense schema (see `SCORING_ENGINE_PLAN.md` §4). Omitted when metadata failed (nothing decoded). Observations are **not** in parquet (single value per video, not per frame).
+- `report.md` — human-readable Markdown tables (`## Metadata`, `## Metadata observations`, `## Capture device`, `## IMU`, `## Technical`, `## Quality`).
+- `{video_name}.json` — same content as MD but structured, JSON-safe (NaN serialised as the string `"NaN"`). Observations live under `metadata_observations`; device + IMU under `capture_device` / `imu`.
+- `{video_name}.parquet` — one row per native frame, dense schema (see `SCORING_ENGINE_PLAN.md` §4). Omitted when metadata failed (nothing decoded). Observations / device / IMU are **not** in parquet (single value per video, not per frame).
+- `{video_stem}_accel.csv` + `{video_stem}_gyro.csv` — IMU raw samples at native cadence. Only when `imu_present=Y`; otherwise both files are absent.
 
 Per batch:
 
-- `batch_report.md`, `batch_results.json`, `batch_results.csv` in the run-dir root. Per-video observations appear as extra columns in the CSV and as an aggregate section at the bottom of the batch MD.
+- `batch_report.md`, `batch_results.json`, `batch_results.csv` in the run-dir root. Per-video observations / device / IMU fields appear as extra columns in the CSV and as aggregate sections at the bottom of the batch MD.
 
 Output layout: `results/run_NNN/{video_name}/report.md`, etc. `NNN` is zero-padded to 3 digits and auto-extends past 999.

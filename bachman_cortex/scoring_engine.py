@@ -59,6 +59,8 @@ from bachman_cortex.checks.view_obstruction import (
 )
 from bachman_cortex.config import Config
 from bachman_cortex.data_types import (
+    CaptureDevice,
+    ImuInfo,
     METADATA_CHECKS,
     MetadataCheckResult,
     ProcessingErrorReport,
@@ -78,9 +80,16 @@ from bachman_cortex.segmentation import (
     segment_confidence_value,
     segment_contact_value,
 )
+from bachman_cortex.utils.device_info import detect_capture_device
 from bachman_cortex.utils.frame_extractor import iter_native_frames
+from bachman_cortex.utils.gpmd import parse_gpmd_highlights
+from bachman_cortex.utils.imu_extraction import ImuSamples, extract_imu
 from bachman_cortex.utils.metadata_observations import build_observations
-from bachman_cortex.utils.video_metadata import get_avg_gop, get_video_metadata
+from bachman_cortex.utils.video_metadata import (
+    collect_tag_surface,
+    get_avg_gop,
+    get_video_metadata,
+)
 
 
 # ── Metadata formatters ────────────────────────────────────────────────────
@@ -287,8 +296,16 @@ class ScoringEngine:
         self,
         video_path: str | Path,
         per_frame_store: PerFrameStore | None = None,
-    ) -> tuple[VideoScoreReport, PerFrameStore | None]:
-        """Score one video. Returns (report, store-or-None-if-metadata-failed)."""
+    ) -> tuple[VideoScoreReport, PerFrameStore | None, ImuSamples]:
+        """Score one video.
+
+        Returns `(report, store, imu_samples)`:
+
+        - `store` is `None` when metadata failed (no decode).
+        - `imu_samples` is always an `ImuSamples` instance; may have
+          `present=False`. The caller writes IMU CSVs when
+          `imu_samples.present` is True.
+        """
         cfg = self.config
         video_path = Path(video_path)
         t_start = time.perf_counter()
@@ -297,11 +314,26 @@ class ScoringEngine:
         meta = get_video_metadata(video_path)
         duration_s = float(meta["duration_s"])
 
-        # Observations are populated for every video (including metadata
-        # failures) — they come from the same ffprobe call plus one cheap
-        # packet-level GOP scan.
+        # ── Non-gating extractions — run unconditionally, even on ───────
+        # metadata-failure paths, so reports always carry device / IMU
+        # rows. None of these decode the video.
         avg_gop = get_avg_gop(video_path)
-        observations = build_observations(meta, avg_gop)
+        gpmd_highlights = parse_gpmd_highlights(video_path)
+        observations = build_observations(meta, avg_gop, gpmd_highlights)
+
+        tag_surface = collect_tag_surface(meta)
+        device_info = detect_capture_device(video_path, tag_surface)
+        capture_device = CaptureDevice(
+            device_type=device_info.device_type,
+            device_model=device_info.device_model,
+        )
+
+        imu_samples = extract_imu(video_path)
+        imu_info = ImuInfo(
+            present=imu_samples.present,
+            accel_hz=imu_samples.accel_hz,
+            gyro_hz=imu_samples.gyro_hz,
+        )
 
         raw_meta = run_all_metadata_checks(meta)
         metadata_checks = _fmt_metadata_checks(
@@ -322,6 +354,8 @@ class ScoringEngine:
                 duration_s=duration_s,
                 metadata_checks=metadata_checks,
                 metadata_observations=observations,
+                capture_device=capture_device,
+                imu=imu_info,
                 technical_checks=[
                     TechnicalCheckResult(check=c, status="skipped",
                                          accepted="-", detected="-", skipped=True)
@@ -334,7 +368,7 @@ class ScoringEngine:
                 ],
                 technical_skipped=True,
                 quality_skipped=True,
-            ), None
+            ), None, imu_samples
 
         # ── Single decode pass ─────────────────────────────────────────
         info, gen = iter_native_frames(video_path)
@@ -515,11 +549,13 @@ class ScoringEngine:
             duration_s=duration_s,
             metadata_checks=metadata_checks,
             metadata_observations=observations,
+            capture_device=capture_device,
+            imu=imu_info,
             technical_checks=technical_checks,
             quality_metrics=quality_metrics,
             technical_skipped=False,
             quality_skipped=quality_skipped,
-        ), store
+        ), store, imu_samples
 
     # ── Parquet fill ───────────────────────────────────────────────────
 

@@ -11,6 +11,8 @@ import pytest
 
 from bachman_cortex.data_types import (
     BatchScoreReport,
+    CaptureDevice,
+    ImuInfo,
     MetadataCheckResult,
     ProcessingErrorReport,
     QualityMetricResult,
@@ -19,6 +21,7 @@ from bachman_cortex.data_types import (
     VideoScoreReport,
 )
 from bachman_cortex.per_frame_store import PerFrameStore
+from bachman_cortex.utils.imu_extraction import ImuSamples
 from bachman_cortex import reporting
 
 
@@ -300,3 +303,128 @@ def test_batch_report_is_valid_json(tmp_path):
     assert parsed["video_count"] == 2
     assert len(parsed["videos"]) == 2
     assert parsed["errors"][0]["error_reason"] == "decode_failed"
+
+
+# ── Capture device + IMU rendering ─────────────────────────────────────────
+
+def _report_with_capture_and_imu() -> VideoScoreReport:
+    r = _happy_video_report()
+    r.capture_device = CaptureDevice(
+        device_type="ext_camera", device_model="GoPro HERO10 Black",
+    )
+    r.imu = ImuInfo(present=True, accel_hz=202.7, gyro_hz=202.7)
+    return r
+
+
+def _report_without_imu() -> VideoScoreReport:
+    r = _happy_video_report()
+    r.capture_device = CaptureDevice(device_type="phone", device_model="Unknown")
+    r.imu = ImuInfo(present=False, accel_hz=None, gyro_hz=None)
+    return r
+
+
+def test_md_renders_capture_device_section(tmp_path):
+    paths = reporting.write_video_report(_report_with_capture_and_imu(), tmp_path)
+    md = paths["md"].read_text()
+    assert "## Capture device" in md
+    assert "| device_type | ext_camera |" in md
+    assert "| device_model | GoPro HERO10 Black |" in md
+
+
+def test_md_renders_imu_present_section(tmp_path):
+    paths = reporting.write_video_report(_report_with_capture_and_imu(), tmp_path)
+    md = paths["md"].read_text()
+    assert "## IMU" in md
+    assert "| imu_present | Y |" in md
+    assert "| imu_accel_hz | 202.7 Hz |" in md
+    assert "| imu_gyro_hz | 202.7 Hz |" in md
+
+
+def test_md_renders_imu_absent_without_rates(tmp_path):
+    paths = reporting.write_video_report(_report_without_imu(), tmp_path)
+    md = paths["md"].read_text()
+    assert "| imu_present | N |" in md
+    assert "| imu_accel_hz | - |" in md
+    assert "| imu_gyro_hz | - |" in md
+
+
+def test_json_includes_capture_device_and_imu(tmp_path):
+    paths = reporting.write_video_report(_report_with_capture_and_imu(), tmp_path)
+    data = json.loads(paths["json"].read_text())
+    assert data["capture_device"] == {
+        "device_type": "ext_camera", "device_model": "GoPro HERO10 Black",
+    }
+    assert data["imu"] == {"present": True, "accel_hz": 202.7, "gyro_hz": 202.7}
+
+
+def test_imu_csvs_written_when_present(tmp_path):
+    samples = ImuSamples(
+        present=True,
+        accel=[(0.0, 1.0, 2.0, 9.81)], gyro=[(0.0, 0.1, 0.2, -0.3)],
+        accel_hz=200.0, gyro_hz=200.0,
+    )
+    paths = reporting.write_video_report(
+        _report_with_capture_and_imu(), tmp_path, imu_samples=samples,
+    )
+    assert "accel_csv" in paths
+    assert "gyro_csv" in paths
+    assert paths["accel_csv"].exists()
+    assert paths["gyro_csv"].exists()
+
+
+def test_imu_csvs_skipped_when_absent(tmp_path):
+    samples = ImuSamples(present=False)
+    paths = reporting.write_video_report(
+        _report_without_imu(), tmp_path, imu_samples=samples,
+    )
+    assert "accel_csv" not in paths
+    assert "gyro_csv" not in paths
+
+
+def test_batch_csv_includes_device_and_imu_columns(tmp_path):
+    videos = [_report_with_capture_and_imu(), _report_without_imu()]
+    meta_stats, tech_stats, qual_stats = reporting.aggregate_batch_stats(videos)
+    batch = BatchScoreReport(
+        generated_at="2026-04-21T00:00:00Z",
+        video_count=2, total_duration_s=120.0, total_wall_time_s=2.0,
+        metadata_check_stats=meta_stats,
+        technical_check_stats=tech_stats,
+        quality_metric_stats=qual_stats,
+        videos=videos,
+    )
+    paths = reporting.write_batch_report(batch, tmp_path)
+    reader = csv.DictReader(io.StringIO(paths["csv"].read_text()))
+    rows = list(reader)
+    for col in ("device_type", "device_model",
+                "imu_present", "imu_accel_hz", "imu_gyro_hz"):
+        assert col in reader.fieldnames, f"missing column: {col}"
+    assert rows[0]["device_type"] == "ext_camera"
+    assert rows[0]["imu_present"] == "Y"
+    assert rows[0]["imu_accel_hz"] == "202.7"
+    assert rows[1]["device_type"] == "phone"
+    assert rows[1]["imu_present"] == "N"
+    assert rows[1]["imu_accel_hz"] == "-"
+
+
+def test_batch_md_aggregate_sections_present(tmp_path):
+    videos = [_report_with_capture_and_imu(), _report_without_imu()]
+    meta_stats, tech_stats, qual_stats = reporting.aggregate_batch_stats(videos)
+    batch = BatchScoreReport(
+        generated_at="2026-04-21T00:00:00Z",
+        video_count=2, total_duration_s=120.0, total_wall_time_s=2.0,
+        metadata_check_stats=meta_stats,
+        technical_check_stats=tech_stats,
+        quality_metric_stats=qual_stats,
+        videos=videos,
+    )
+    paths = reporting.write_batch_report(batch, tmp_path)
+    md = paths["md"].read_text()
+    assert "## Capture device (aggregate)" in md
+    assert "## IMU (aggregate)" in md
+    # Histogram entries for both videos
+    assert "ext_camera: 1" in md
+    assert "phone: 1" in md
+    # imu_present distribution: one Y, one N
+    assert "Y: 1" in md and "N: 1" in md
+    # Numeric stats computed only over IMU=Y videos (1 here)
+    assert "| imu_accel_hz | 202.7 | 202.7 | 202.7 | 202.7 |" in md

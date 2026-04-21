@@ -20,11 +20,16 @@ that fail the technical stage happen downstream.
 
 ```
 ffprobe metadata → run_all_metadata_checks
-   │              → build_observations (non-gating; 7 fields always populated)
+   │              → parse_gpmd_highlights (GPMF scanner; GoPro camera model /
+   │                                       lens label / HyperSmooth state)
+   │              → build_observations    (7 observations; consumes GPMF when present)
+   │              → detect_capture_device (ext_camera / phone / Unknown + model)
+   │              → extract_imu           (accel + gyro via telemetry-parser)
    │
    ├── any fail? ──▶ VideoScoreReport with all technical/quality = SKIPPED.
-   │                 Observations still populated. Write report.md +
-   │                 {video}.json. NO parquet.
+   │                 Observations, capture_device, and imu still populated.
+   │                 IMU CSVs written when both sensors present.
+   │                 Write report.md + {video}.json. NO parquet.
    ▼
 [Stage 2 + 3] Single streaming decode pass @ native FPS
    │   each native frame dispatched to accumulators by cadence:
@@ -45,7 +50,8 @@ ffprobe metadata → run_all_metadata_checks
 [Stage 3 finalize] whole-video aggregation of quality metrics
    │   group per-frame → runs → merge short runs → segments
    │
-Write {video}.parquet, {video}.json, report.md.
+Write {video}.parquet, {video}.json, report.md,
+      {video}_accel.csv + {video}_gyro.csv (only when imu_present).
 ```
 
 Batch mode calls `ScoringEngine.score_video` per input and aggregates
@@ -68,7 +74,10 @@ the reports; see `batch.score_batch`.
 | `utils/frame_extractor.py`             | `iter_native_frames` — NVDEC/cv2 generator + 720p resize.     |
 | `utils/video_metadata.py`              | ffprobe wrapper + avg-GOP packet scan + tag-surface flattener. |
 | `utils/metadata_observations.py`       | Seven non-gating metadata observations + vendor registry for stabilization / FOV. |
-| `utils/gpmd.py`                        | GoPro GPMD timed-metadata stub (real KLV parser lands with IMU extraction). |
+| `utils/gpmd.py`                        | GPMF presence detector + Highlights scanner (camera model, lens preset, HyperSmooth state). |
+| `utils/device_info.py`                 | Capture-device registry: `ext_camera` / `phone` / `Unknown` + model string. |
+| `utils/imu_extraction.py`              | `telemetry-parser` wrapper → (accel, gyro) samples + per-sensor mean rates. |
+| `utils/imu_csv.py`                     | Writes `{video}_accel.csv` + `{video}_gyro.csv` at native cadence. |
 | `checks/video_metadata.py`             | Six metadata checks against ffprobe output.                    |
 | `checks/motion_analysis.py`            | `MotionAnalyzer` (stability + frozen finalise).                |
 | `checks/luminance.py`                  | `LuminanceAccumulator`.                                        |
@@ -105,6 +114,18 @@ the reports; see `batch.score_batch`.
   — even on metadata-gate failure — because they come from the same
   ffprobe call plus one cheap packet-level GOP scan. No decode, no
   model inference.
+- **Capture-device + IMU extraction run before the metadata gate**,
+  so `capture_device` / `imu` fields and IMU CSVs are produced even
+  for metadata-failed videos. Neither path decodes the video.
+- **IMU CSVs are native-cadence per sensor.** `present=True` requires
+  BOTH gyroscope and accelerometer; single-sensor containers report
+  `imu_present=N` and write no CSV.
+- **Re-encoded files lose vendor identity.** Any ffmpeg retranscode
+  (including the default NVENC lossless path in this repo) strips
+  `com.apple.quicktime.*`, `com.android.*`, and GoPro `GPMD` tracks.
+  Re-encoded clips therefore read as `device_type=Unknown,
+  device_model=Unknown` with `imu_present=N`. Run IMU + device
+  extraction on the original file when that data matters downstream.
 
 ---
 

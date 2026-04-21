@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from bachman_cortex.data_types import MetadataObservations
-from bachman_cortex.utils.gpmd import detect_gpmd_stream
+from bachman_cortex.utils.gpmd import GpmdHighlights, detect_gpmd_stream
 from bachman_cortex.utils.video_metadata import collect_tag_surface
 
 
@@ -101,12 +101,16 @@ def compute_hdr(
 
 # ── Vendor registry: stabilization ─────────────────────────────────────────
 
-def detect_stabilization(tag_surface: dict[str, Any], raw_streams: list[dict]) -> str:
+def detect_stabilization(
+    tag_surface: dict[str, Any],
+    raw_streams: list[dict],
+    gpmd_highlights: GpmdHighlights | None = None,
+) -> str:
     """Return "Y" / "N" / "Unknown" per the vendor registry.
 
     Detectors are evaluated in priority order; first positive match wins.
-    The ordering favours post-stabilization tools (an explicit
-    affirmative signal) over baked-in camera encoders.
+    The ordering favours explicit parsed state (GPMF HyperSmooth flag)
+    over container-level presence heuristics.
 
     Absence of any signal is reported as `Unknown` — not `N` — because
     most containers do not carry a "stabilization: off" marker.
@@ -119,14 +123,18 @@ def detect_stabilization(tag_surface: dict[str, Any], raw_streams: list[dict]) -
         (h or "").lower() for h in tag_surface.get("all_stream_handler_names", []) or []
     ]
 
+    # 0. Parsed GoPro HyperSmooth state (authoritative when available).
+    if gpmd_highlights is not None and gpmd_highlights.hypersmooth_state:
+        state = gpmd_highlights.hypersmooth_state.upper()
+        return "N" if state in ("OFF", "N", "NO") else "Y"
+
     # 1. Post-stabilization tools named in the encoder string.
     if re.search(r"\b(gyroflow|reelsteady|hypersmooth)\b", encoder):
         return "Y"
 
-    # 2. GoPro encoder — HyperSmooth is baked into the pixels when used.
-    #    Presence of the GoPro AVC/HEVC encoder is a reasonable proxy;
-    #    the GPMD stream carries the precise HyperSmooth state for
-    #    future refinement.
+    # 2. GoPro encoder — HyperSmooth is typically baked into the pixels.
+    #    Kept as a fallback for re-encoded GoPro files where the GPMF
+    #    Highlights block is absent.
     if "gopro" in encoder:
         return "Y"
     if detect_gpmd_stream(raw_streams).present:
@@ -197,17 +205,19 @@ _APPLE_FOCAL_35MM_KEYS = (
 def detect_fov(
     tag_surface: dict[str, Any],
     raw_streams: list[dict],
+    gpmd_highlights: GpmdHighlights | None = None,
 ) -> str:
-    """Return a raw vendor FOV label (string) or "Unknown".
+    """Return a vendor FOV label (string) or "Unknown".
 
     Registry order (first match wins):
 
-    1. GoPro — GPMD stream present. Without the KLV parser we cannot
-       read the actual lens preset yet, so report "GoPro-embedded" so
-       the report reflects that richer data exists and is pending the
-       IMU-extraction work that will unlock it.
-    2. DJI — `handler_name` / encoder matches; real `udta` parser not
-       yet wired, return "DJI-embedded".
+    0. GPMF Highlights — parsed lens preset ("Wide", "Linear",
+       "SuperView", "Narrow", "HyperView") and horizontal FOV in
+       degrees. Formatted as e.g. "Wide (~133°)".
+    1. GoPro presence fallback — GPMD stream present but settings
+       block did not parse: return "GoPro-embedded".
+    2. DJI — `handler_name` / encoder matches; `udta` parser not yet
+       wired; return "DJI-embedded".
     3. Apple — derive degrees from the iPhone 35mm-equivalent focal
        length tag when present.
     4. Nothing found → "Unknown".
@@ -218,6 +228,11 @@ def detect_fov(
     all_handler_names = [
         (h or "").lower() for h in tag_surface.get("all_stream_handler_names", []) or []
     ]
+
+    if gpmd_highlights is not None and gpmd_highlights.lens_label:
+        if gpmd_highlights.fov_deg is not None:
+            return f"{gpmd_highlights.lens_label} (~{gpmd_highlights.fov_deg:.0f}°)"
+        return gpmd_highlights.lens_label
 
     if detect_gpmd_stream(raw_streams).present or "gopro" in encoder:
         return "GoPro-embedded"
@@ -259,9 +274,17 @@ def _fov_from_35mm_equiv(val: Any) -> float | None:
 
 # ── Top-level builder ──────────────────────────────────────────────────────
 
-def build_observations(meta: dict, avg_gop: float | None) -> MetadataObservations:
-    """Assemble the full `MetadataObservations` from an ffprobe meta dict
-    and a precomputed GOP average.
+def build_observations(
+    meta: dict,
+    avg_gop: float | None,
+    gpmd_highlights: GpmdHighlights | None = None,
+) -> MetadataObservations:
+    """Assemble the full `MetadataObservations` from an ffprobe meta dict,
+    a precomputed GOP average, and (optionally) parsed GPMF Highlights.
+
+    When `gpmd_highlights` is supplied and carries a parsed lens label
+    or HyperSmooth state, the stabilization / FOV fields use the
+    authoritative values instead of the presence-based fallbacks.
     """
     tag_surface = collect_tag_surface(meta)
     raw_streams = meta.get("_raw_streams", []) or []
@@ -281,6 +304,6 @@ def build_observations(meta: dict, avg_gop: float | None) -> MetadataObservation
             codec_tag_string=meta.get("codec_tag_string", ""),
             side_data_types=side_data_types,
         ),
-        stabilization=detect_stabilization(tag_surface, raw_streams),
-        fov=detect_fov(tag_surface, raw_streams),
+        stabilization=detect_stabilization(tag_surface, raw_streams, gpmd_highlights),
+        fov=detect_fov(tag_surface, raw_streams, gpmd_highlights),
     )

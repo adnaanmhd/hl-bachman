@@ -32,7 +32,11 @@ from typing import Any
 
 from bachman_cortex.data_types import (
     BatchScoreReport,
+    CAPTURE_DEVICE_FIELDS,
+    CaptureDevice,
     CheckStats,
+    IMU_FIELDS,
+    ImuInfo,
     METADATA_CHECKS,
     METADATA_OBSERVATIONS,
     METADATA_OBSERVATION_CATEGORICAL,
@@ -46,9 +50,12 @@ from bachman_cortex.data_types import (
     QualityStats,
     TECHNICAL_CHECKS,
     TechnicalCheckResult,
+    UNKNOWN_SENTINEL,
     VideoScoreReport,
 )
 from bachman_cortex.per_frame_store import PerFrameStore
+from bachman_cortex.utils.imu_csv import write_imu_csvs
+from bachman_cortex.utils.imu_extraction import ImuSamples
 
 
 _STATUS_DISPLAY = {
@@ -173,6 +180,59 @@ def _render_observations_table(obs: MetadataObservations | None) -> str:
     return "\n".join(lines)
 
 
+# ── Capture device + IMU rendering ─────────────────────────────────────────
+
+def _fmt_hz(val: float | None) -> str:
+    if val is None:
+        return "-"
+    return f"{val:.1f} Hz"
+
+
+def _render_capture_device_table(cd: CaptureDevice | None) -> str:
+    lines = ["| Field | Value |", "|---|---|"]
+    if cd is None:
+        lines.append(f"| device_type | {UNKNOWN_SENTINEL} |")
+        lines.append(f"| device_model | {UNKNOWN_SENTINEL} |")
+        return "\n".join(lines)
+    lines.append(f"| device_type | {cd.device_type} |")
+    lines.append(f"| device_model | {cd.device_model} |")
+    return "\n".join(lines)
+
+
+def _render_imu_table(imu: ImuInfo | None) -> str:
+    lines = ["| Field | Value |", "|---|---|"]
+    if imu is None:
+        lines.append("| imu_present | N |")
+        lines.append("| imu_accel_hz | - |")
+        lines.append("| imu_gyro_hz | - |")
+        return "\n".join(lines)
+    lines.append(f"| imu_present | {'Y' if imu.present else 'N'} |")
+    lines.append(f"| imu_accel_hz | {_fmt_hz(imu.accel_hz)} |")
+    lines.append(f"| imu_gyro_hz | {_fmt_hz(imu.gyro_hz)} |")
+    return "\n".join(lines)
+
+
+def _csv_capture_device_value(field: str, cd: CaptureDevice | None) -> str:
+    if cd is None:
+        return UNKNOWN_SENTINEL
+    return getattr(cd, field)
+
+
+def _csv_imu_value(field: str, imu: ImuInfo | None) -> str:
+    """CSV cell for IMU fields. `imu_present` → Y/N; Hz fields → numeric
+    string or `-` when the field is None."""
+    if imu is None:
+        if field == "imu_present":
+            return "N"
+        return "-"
+    if field == "imu_present":
+        return "Y" if imu.present else "N"
+    val = getattr(imu, field.removeprefix("imu_"), None)
+    if val is None:
+        return "-"
+    return f"{float(val):.1f}"
+
+
 def _render_technical_table(checks: list[TechnicalCheckResult]) -> str:
     lines = ["| Check | Status | Accepted | Detected |",
              "|---|---|---|---|"]
@@ -228,6 +288,14 @@ def _render_video_markdown(report: VideoScoreReport) -> str:
         "",
         _render_observations_table(report.metadata_observations),
         "",
+        "## Capture device",
+        "",
+        _render_capture_device_table(report.capture_device),
+        "",
+        "## IMU",
+        "",
+        _render_imu_table(report.imu),
+        "",
         "## Technical",
         "",
         _render_technical_table(report.technical_checks),
@@ -245,11 +313,16 @@ def write_video_report(
     report: VideoScoreReport,
     out_dir: str | Path,
     per_frame_store: PerFrameStore | None = None,
+    imu_samples: ImuSamples | None = None,
 ) -> dict[str, Path]:
-    """Write `report.md`, `{video_name}.json`, and (if applicable) parquet.
+    """Write `report.md`, `{video_name}.json`, optional parquet, and
+    optional IMU CSVs.
 
     Returns the map of artefact name → absolute path actually written.
-    Parquet is skipped when the metadata stage failed (no decode).
+
+    - Parquet is skipped when the metadata stage failed (no decode).
+    - IMU CSVs are written only when `imu_samples.present` is True —
+      both `{stem}_accel.csv` and `{stem}_gyro.csv` or neither.
     """
     video_dir = Path(out_dir) / Path(report.video_name).stem
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -265,6 +338,9 @@ def write_video_report(
         parquet_path = video_dir / f"{Path(report.video_name).stem}.parquet"
         per_frame_store.flush(parquet_path)
         paths["parquet"] = parquet_path
+    if imu_samples is not None and imu_samples.present:
+        imu_paths = write_imu_csvs(imu_samples, video_dir, report.video_name)
+        paths.update(imu_paths)
     return paths
 
 
@@ -328,6 +404,8 @@ def _render_batch_markdown(batch: BatchScoreReport) -> str:
             )
 
     lines.extend(_render_observations_aggregate(batch.videos))
+    lines.extend(_render_capture_device_aggregate(batch.videos))
+    lines.extend(_render_imu_aggregate(batch.videos))
 
     if batch.errors:
         lines.extend([
@@ -440,6 +518,82 @@ def _render_observations_aggregate(videos: list[VideoScoreReport]) -> list[str]:
     return out
 
 
+def _render_capture_device_aggregate(videos: list[VideoScoreReport]) -> list[str]:
+    """Distribution histograms for `device_type` and `device_model`."""
+    if not videos:
+        return []
+    histograms: dict[str, dict[str, int]] = {
+        f: {} for f in CAPTURE_DEVICE_FIELDS
+    }
+    for v in videos:
+        cd = v.capture_device
+        for f in CAPTURE_DEVICE_FIELDS:
+            key = getattr(cd, f, UNKNOWN_SENTINEL) if cd is not None else UNKNOWN_SENTINEL
+            key = key or UNKNOWN_SENTINEL
+            histograms[f][key] = histograms[f].get(key, 0) + 1
+
+    out = ["", "## Capture device (aggregate)", "",
+           "| Field | Distribution |", "|---|---|"]
+    for f in CAPTURE_DEVICE_FIELDS:
+        hist = histograms[f]
+        if not hist:
+            out.append(f"| {f} | - |")
+            continue
+        ordered = sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))
+        body = ", ".join(f"{label}: {count}" for label, count in ordered)
+        out.append(f"| {f} | {body} |")
+    return out
+
+
+def _render_imu_aggregate(videos: list[VideoScoreReport]) -> list[str]:
+    """Histogram for `imu_present`; numeric stats for accel/gyro Hz over
+    videos that actually carry an IMU stream."""
+    if not videos:
+        return []
+
+    present_hist: dict[str, int] = {}
+    accel_rates: list[float] = []
+    gyro_rates: list[float] = []
+
+    for v in videos:
+        imu = v.imu
+        if imu is None:
+            present_hist["N"] = present_hist.get("N", 0) + 1
+            continue
+        present_key = "Y" if imu.present else "N"
+        present_hist[present_key] = present_hist.get(present_key, 0) + 1
+        if imu.present:
+            if imu.accel_hz is not None:
+                accel_rates.append(float(imu.accel_hz))
+            if imu.gyro_hz is not None:
+                gyro_rates.append(float(imu.gyro_hz))
+
+    out = ["", "## IMU (aggregate)", "",
+           "| Field | Distribution |", "|---|---|"]
+    ordered = sorted(present_hist.items(), key=lambda kv: (-kv[1], kv[0]))
+    out.append(
+        f"| imu_present | {', '.join(f'{k}: {c}' for k, c in ordered) or '-'} |"
+    )
+
+    if accel_rates or gyro_rates:
+        out.extend([
+            "",
+            "| Field | Mean | Median | Min | Max |",
+            "|---|---|---|---|---|",
+        ])
+        for label, vals in (("imu_accel_hz", accel_rates),
+                            ("imu_gyro_hz", gyro_rates)):
+            if not vals:
+                out.append(f"| {label} | - | - | - | - |")
+                continue
+            out.append(
+                f"| {label} | {statistics.fmean(vals):.1f} | "
+                f"{statistics.median(vals):.1f} | "
+                f"{min(vals):.1f} | {max(vals):.1f} |"
+            )
+    return out
+
+
 def _batch_report_to_dict(batch: BatchScoreReport) -> dict[str, Any]:
     d = dataclasses.asdict(batch)
     for video in d.get("videos", []):
@@ -462,6 +616,10 @@ def _render_batch_csv(batch: BatchScoreReport) -> str:
         header.append(f"quality_{m}_pct")
     for f in METADATA_OBSERVATIONS:
         header.append(f"meta_{f}")
+    for f in CAPTURE_DEVICE_FIELDS:
+        header.append(f)
+    for f in IMU_FIELDS:
+        header.append(f)
     rows.append(header)
 
     for v in batch.videos:
@@ -494,6 +652,10 @@ def _render_batch_csv(batch: BatchScoreReport) -> str:
                 f, getattr(v.metadata_observations, f, None)
                 if v.metadata_observations is not None else None
             ))
+        for f in CAPTURE_DEVICE_FIELDS:
+            row.append(_csv_capture_device_value(f, v.capture_device))
+        for f in IMU_FIELDS:
+            row.append(_csv_imu_value(f, v.imu))
         rows.append(row)
 
     import io

@@ -45,6 +45,36 @@ class MetadataObservations:
     fov: str
 
 
+# ── Capture device (non-gating) ───────────────────────────────────────────
+
+@dataclass
+class CaptureDevice:
+    """Device-identifying extraction. `device_type` is coarse
+    (`"ext_camera"` covers action cams + drones + mirrorless; `"phone"`
+    covers iPhone + Android); `device_model` is a single combined
+    string like `"HERO10 Black"` or `"Apple iPhone 14 Pro"`. Both
+    default to `"Unknown"` when no identifying signal is found (common
+    for re-encoded files that strip vendor tags — see `checks.md`).
+    """
+    device_type: str    # "ext_camera" | "phone" | "Unknown"
+    device_model: str   # combined string or "Unknown"
+
+
+# ── IMU (non-gating) ──────────────────────────────────────────────────────
+
+@dataclass
+class ImuInfo:
+    """IMU presence + per-sensor sample rates. `present` is True only
+    when BOTH gyroscope and accelerometer streams were parsed
+    successfully (plan §3 of the IMU extension). CSV files are written
+    alongside the report only when `present` is True. Rates are
+    mean-rate in Hz for variable-rate streams.
+    """
+    present: bool
+    accel_hz: float | None
+    gyro_hz: float | None
+
+
 # ── Technical stage ───────────────────────────────────────────────────────
 
 @dataclass
@@ -123,6 +153,8 @@ class VideoScoreReport:
 
     metadata_checks: list[MetadataCheckResult] = field(default_factory=list)
     metadata_observations: MetadataObservations | None = None
+    capture_device: CaptureDevice | None = None
+    imu: ImuInfo | None = None
     technical_checks: list[TechnicalCheckResult] = field(default_factory=list)
     quality_metrics: list[QualityMetricResult] = field(default_factory=list)
 
@@ -193,3 +225,14 @@ METADATA_OBSERVATION_NUMERIC: tuple[str, ...] = (
 METADATA_OBSERVATION_CATEGORICAL: tuple[str, ...] = (
     "b_frames", "hdr", "stabilization", "fov",
 )
+
+# Capture-device + IMU field names (canonical order for MD rows and CSV cols).
+CAPTURE_DEVICE_FIELDS: tuple[str, ...] = (
+    "device_type", "device_model",
+)
+IMU_FIELDS: tuple[str, ...] = (
+    "imu_present", "imu_accel_hz", "imu_gyro_hz",
+)
+
+# Sentinel strings used in MD + batch CSV rendering (JSON uses native types).
+UNKNOWN_SENTINEL: str = "Unknown"
